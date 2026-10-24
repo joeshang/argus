@@ -1,9 +1,9 @@
 {
-    "name": "com.argus.extension.helper",
-    "description": "Argus Extension Helper",
-    "path": "/Users/cshang/Library/Developer/Xcode/DerivedData/ArgusMacServices-gzworhwgrexamrgzytvgprqnsvoy/Build/Products/Debug/ArgusMacServices",
-    "type": "stdio",
-    "allowed_origins": [
-        "chrome-extension://knldjmfmopnpolahpmmgbagdohdnhkik/"
-    ]
+  "name": "com.argus.extension.helper",
+  "description": "Argus Extension Helper",
+  "path": "/absolute/path/to/ArgusMacExtensionHelper",
+  "type": "stdio",
+  "allowed_origins": [
+    "chrome-extension://knldjmfmopnpolahpmmgbagdohdnhkik/"
+  ]
 }

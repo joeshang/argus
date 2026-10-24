@@ -11,6 +11,10 @@
 #include <libproc.h>
 #include <cstdint>
 #include <string>
+#include <functional>
+#include <mutex>
+#include <condition_variable>
+#include <thread>
 #include <vector>
 #include <iostream>
 #include <unordered_map>
@@ -101,71 +105,43 @@ struct SafariProcessInfo {
 };
 
 
+struct BrowserSnapshot {
+    std::vector<ChromiumProcessInfo> chrome;
+    std::vector<ChromiumProcessInfo> edge;
+    std::vector<SafariProcessInfo> safari;
+    std::vector<WebMetricData> chromeWebMetric;
+    std::vector<WebMetricData> edgeWebMetric;
+    std::vector<WebMetricData> safariWebMetric;
+};
+
 class BrowserMonitor {
 public:
-    void beginMetric(int interval,
-                     std::function<void(void)> callback);
-    void receiveMessage(std::string &message);
+    ~BrowserMonitor();
+    // Start/stop are called by the owning thread, never from the sample callback.
+    void beginMetric(int interval, std::function<void(BrowserSnapshot)> callback);
+    void stopMetric();
+    void receiveMessage(const std::string& message);
+    BrowserSnapshot snapshot() const;
     void printUsage();
 
-    std::vector<ChromiumProcessInfo> getChromeProcessInfo() { return m_chromeProcesses; }
-    std::vector<ChromiumProcessInfo> getEdgeProcessInfo() { return m_edgeProcesses; }
-    std::vector<SafariProcessInfo> getSafariProcessInfo() { return m_safariProcesses; }
-    std::vector<WebMetricData> getChromeWebMetric() {
-        std::vector<WebMetricData> result {};
-        for (const auto& item: m_chromeProcesses) {
-            if (item.type != ChromiumProcessType::Tab) {
-                continue;
-            }
-            if (!m_chromeTabInfos.contains(item.rendererClientId)) {
-                continue;
-            }
-            auto metric = m_chromeTabInfos[item.rendererClientId];
-            if (!metric.withMetric) {
-                continue;
-            }
-            result.push_back(metric);
-        }
-        return result;
-    }
-    std::vector<WebMetricData> getEdgeWebMetric() {
-        std::vector<WebMetricData> result {};
-        for (const auto& item: m_edgeProcesses) {
-            if (item.type != ChromiumProcessType::Tab) {
-                continue;
-            }
-            if (!m_edgeTabInfos.contains(item.rendererClientId)) {
-                continue;
-            }
-            auto metric = m_edgeTabInfos[item.rendererClientId];
-            if (!metric.withMetric) {
-                continue;
-            }
-            result.push_back(metric);
-        }
-        return result;
-    }
-    std::vector<WebMetricData> getSafariWebMetric() {
-        std::vector<WebMetricData> result {};
-        // TODO:
-        return result;
-    }
-
 private:
+    BrowserSnapshot snapshotLocked() const;
     void queryBrowserProcesses();
     void fetchBrowserProcessUsage();
     void handleChromiumProcessArguments(ChromiumProcessInfo &info);
     UsageData getProcessUsage(pid_t pid);
 
+    mutable std::mutex m_mutex;
+    std::condition_variable m_wakeup;
+    std::thread m_sampler;
+    bool m_stopping = true;
     int m_sampleInterval = 5;
-    std::function<void(void)> m_metricCallback = nullptr;
     std::vector<ChromiumProcessInfo> m_chromeProcesses;
     std::vector<ChromiumProcessInfo> m_edgeProcesses;
     std::vector<SafariProcessInfo> m_safariProcesses;
     std::unordered_map<pid_t, UsageData> m_prevUsage;
     std::unordered_map<int, WebMetricData> m_chromeTabInfos;
     std::unordered_map<int, WebMetricData> m_edgeTabInfos;
-    std::unordered_map<int, WebMetricData> m_safariTabInfos;
 };
 
 #endif /* ProcessMonitor_hpp */

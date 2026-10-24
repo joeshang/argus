@@ -1,117 +1,157 @@
-//
-//  SocketServer.cpp
-//  ArgusMacServices
-//
-//  Created by Chuanren Shang on 2022/12/4.
-//
-
 #include "SocketServer.hpp"
-#include <cstdio>
+#include "../../../native-common/Framing.hpp"
+#include "../../../native-common/LocalSocket.hpp"
+
+#include <atomic>
 #include <iostream>
-#include <sys/socket.h>
-#include <sys/stat.h>
-#include <sys/un.h>
-#include <CoreFoundation/CFRunLoop.h>
+#include <poll.h>
+#include <sys/file.h>
+#include <thread>
+#include <vector>
 
-static const char *socket_path = "/tmp/com.argus.channel";
+namespace {
+constexpr size_t kMaxClients = 64;
 
-void SocketServer::setup() {
-    m_socket = socket(AF_UNIX, SOCK_STREAM, 0);
-    if (m_socket == -1) {
-        std::cerr << "socket failed\n";
-        return;
-    }
-
-    std::cout << "bind\n";
-    // delete existed socket's file, otherwise bind will failed
-    unlink(socket_path);
-    // make unix domain socket's file writable by non root program
-    int mask = umask(777);
-    struct sockaddr_un local;
-    memset(&local, 0, sizeof(local));
-    local.sun_family = AF_UNIX;
-    strncpy(local.sun_path, socket_path, sizeof(local.sun_path));
-    if (bind(m_socket, (struct sockaddr *)&local, sizeof(local)) != 0) {
-        std::cerr << "bind failed\n";
-        return;
-    }
-    umask(mask);
-
-    std::cout << "listen\n";
-    if (listen(m_socket, 10) != 0) {
-        std::cerr << "listen failed\n";
-        return;
-    }
-
-    (void)fcntl(m_socket, F_SETFL, O_NONBLOCK);
-
-    std::cout << "wait for connection...\n";
-    dispatch_queue_t queue = dispatch_get_global_queue(DISPATCH_QUEUE_PRIORITY_DEFAULT, 0);
-    m_acceptSource = dispatch_source_create(DISPATCH_SOURCE_TYPE_READ, m_socket, 0, queue);
-    dispatch_source_set_event_handler(m_acceptSource, ^{
-        unsigned int sock_len = 0;
-        struct sockaddr_un remote;
-        memset(&remote, 0, sizeof(remote));
-        int acceptFd = accept(m_socket, (struct sockaddr*)&remote, &sock_len);
-        if (acceptFd == -1) {
-            std::cerr << "accept failed\n";
-            dispatch_source_cancel(m_acceptSource);
-        }
-        std::cout << "new connection: " << acceptFd << "\n";
-        receiveClientData(acceptFd);
-        std::string m = "native service connected";
-        sendMessage(m, acceptFd);
-    });
-
-    dispatch_source_set_cancel_handler(m_acceptSource, ^{
-        close(m_socket);
-        dispatch_release(m_acceptSource);
-        m_acceptSource = NULL;
-    });
-
-    dispatch_resume(m_acceptSource);
+struct Client {
+    argus::UniqueFd fd;
+    argus::FrameDecoder decoder;
+    argus::FrameWriter writer;
+};
 }
 
+struct SocketServer::State {
+    explicit State(std::function<void(const std::string&)> callback) : handle(std::move(callback)) {}
+    std::function<void(const std::string&)> handle;
+    std::unique_ptr<argus::LocalEndpoint> endpoint;
+    argus::UniqueFd lock;
+    argus::UniqueFd listener;
+    std::vector<Client> clients;
+    std::atomic<bool> running { false };
+    std::thread thread;
+    dev_t device = 0;
+    ino_t inode = 0;
 
-void SocketServer::receiveClientData(int fd) {
-    dispatch_queue_t queue = dispatch_get_global_queue(DISPATCH_QUEUE_PRIORITY_DEFAULT, 0);
-    dispatch_source_t recvSource = dispatch_source_create(DISPATCH_SOURCE_TYPE_READ, fd, 0, queue);
-
-    dispatch_source_set_event_handler(recvSource, ^{
-        char raw_length[4];
-        memset(raw_length, 0, 4);
-        size_t recv_len = recv(fd, raw_length, 4, 0);
-        if (recv_len <= 0) {
-            dispatch_cancel(recvSource);
-            return;
+    ~State() {
+        running = false;
+        if (thread.joinable()) thread.join();
+        clients.clear();
+        listener = argus::UniqueFd();
+        // Keep the lock file inode stable across runs. Only remove our socket
+        // while still holding the exclusive service lock.
+        struct stat info {};
+        if (endpoint && inode != 0 && fstatat(endpoint->directory.get(), "channel.sock", &info, AT_SYMLINK_NOFOLLOW) == 0 &&
+            info.st_ino == inode && info.st_dev == device) {
+            unlinkat(endpoint->directory.get(), "channel.sock", 0);
         }
-        uint32_t message_length = *reinterpret_cast<uint32_t*>(raw_length);
-//        std::cout << "message length: " << message_length << ", raw: " << raw_length << "\n";
-        if (!message_length) {
-            exit(EXIT_SUCCESS);
-        };
+    }
 
-        char message[message_length];
-        recv_len = recv(fd, message, message_length, 0);
-        if (recv_len <= 0) {
-            dispatch_cancel(recvSource);
-            return;
+    void acceptClients() {
+        while (running) {
+            argus::UniqueFd fd(accept(listener.get(), nullptr, nullptr));
+            if (fd.get() < 0) {
+                if (errno == EINTR || errno == ECONNABORTED) continue;
+                if (errno != EAGAIN && errno != EWOULDBLOCK) std::cerr << "Argus accept failed: " << strerror(errno) << '\n';
+                return;
+            }
+            if (clients.size() >= kMaxClients || !argus::sameUser(fd.get())) continue;
+            try {
+                argus::nonblocking(fd.get());
+                argus::noSigPipe(fd.get());
+                Client client { std::move(fd), {}, {} };
+                client.writer.append("native service connected");
+                clients.push_back(std::move(client));
+            } catch (const std::exception& error) {
+                std::cerr << error.what() << '\n';
+            }
         }
-        std::string m(message, message + sizeof(message) / sizeof(message[0]));
-        m_handleMessage(m);
-    });
-    dispatch_source_set_cancel_handler(recvSource, ^{
-        std::cout << "lost connection: " << fd << "\n";
-        close(fd);
-        dispatch_release(recvSource);
-    });
-    dispatch_resume(recvSource);
-}
+    }
 
-void SocketServer::sendMessage(std::string &message, int fd) {
-    auto size = uint32_t(message.size());
-    char* length = reinterpret_cast<char*>(&size);
-    send(fd, length, 4, 0);
-    send(fd, message.c_str(), message.length(), 0);
-}
+    bool readClient(Client& client) {
+        char buffer[8192];
+        // Bound work per client per poll iteration so a busy peer cannot starve
+        // other clients or shutdown. Remaining bytes stay readable for next poll.
+        for (int chunk = 0; chunk < 16; ++chunk) {
+            const auto count = read(client.fd.get(), buffer, sizeof(buffer));
+            if (count > 0) {
+                try {
+                    if (!client.decoder.feed(buffer, static_cast<size_t>(count), handle)) return false;
+                } catch (const std::exception& error) {
+                    std::cerr << "Argus rejected client message: " << error.what() << '\n';
+                    return false;
+                }
+            } else if (count == 0) {
+                if (!client.decoder.complete()) std::cerr << "Argus client closed in a partial frame\n";
+                return false;
+            } else if (errno == EINTR) continue;
+            else return errno == EAGAIN || errno == EWOULDBLOCK;
+        }
+        return true;
+    }
 
+    void run() {
+        while (running) {
+            std::vector<pollfd> descriptors {{ listener.get(), POLLIN, 0 }};
+            for (const auto& client : clients) {
+                descriptors.push_back({ client.fd.get(), short(POLLIN | (client.writer.pending() ? POLLOUT : 0)), 0 });
+            }
+            const int result = poll(descriptors.data(), static_cast<nfds_t>(descriptors.size()), 100);
+            if (result < 0) {
+                if (errno == EINTR) continue;
+                std::cerr << "Argus poll failed: " << strerror(errno) << '\n';
+                break;
+            }
+            // Process the existing client set before accept can append clients.
+            for (size_t i = clients.size(); i > 0; --i) {
+                auto& client = clients[i - 1];
+                const auto events = descriptors[i].revents;
+                bool alive = true;
+                if (events & (POLLIN | POLLHUP)) alive = readClient(client);
+                if (alive && (events & POLLOUT)) alive = client.writer.flush(client.fd.get());
+                if (events & (POLLERR | POLLNVAL)) alive = false;
+                if (!alive) clients.erase(clients.begin() + (i - 1));
+            }
+            if (descriptors[0].revents & POLLIN) acceptClients();
+        }
+    }
+};
+
+SocketServer::SocketServer(std::function<void(const std::string&)> handle)
+    : m_state(std::make_unique<State>(std::move(handle))) {}
+SocketServer::~SocketServer() = default;
+
+bool SocketServer::setup() {
+    auto& state = *m_state;
+    if (state.running) return true;
+    try {
+        state.endpoint = std::make_unique<argus::LocalEndpoint>(argus::LocalEndpoint::open());
+        state.lock = argus::UniqueFd(openat(state.endpoint->directory.get(), "service.lock", O_RDWR | O_CREAT | O_NOFOLLOW | O_CLOEXEC, 0600));
+        struct stat info {};
+        if (state.lock.get() < 0 || fstat(state.lock.get(), &info) < 0 || !S_ISREG(info.st_mode) ||
+            info.st_uid != geteuid() || (info.st_mode & 0077) != 0 || flock(state.lock.get(), LOCK_EX | LOCK_NB) < 0) {
+            throw std::runtime_error("Cannot acquire Argus service lock (another instance may be running)");
+        }
+        if (fstatat(state.endpoint->directory.get(), "channel.sock", &info, AT_SYMLINK_NOFOLLOW) == 0) {
+            if (!S_ISSOCK(info.st_mode) || info.st_uid != geteuid()) throw std::runtime_error("Refusing to replace an untrusted socket path");
+            if (unlinkat(state.endpoint->directory.get(), "channel.sock", 0) < 0) throw std::runtime_error("Cannot remove stale Argus socket");
+        } else if (errno != ENOENT) throw std::runtime_error("Cannot inspect Argus socket path");
+        state.listener = argus::UniqueFd(socket(AF_UNIX, SOCK_STREAM, 0));
+        if (state.listener.get() < 0) throw std::runtime_error("Cannot create Argus socket");
+        argus::nonblocking(state.listener.get());
+        // The enclosing directory is already private (0700). Avoid a process-
+        // global umask change entirely; set the socket's final mode explicitly.
+        if (bind(state.listener.get(), reinterpret_cast<const sockaddr*>(&state.endpoint->address), sizeof(sockaddr_un)) < 0) {
+            throw std::runtime_error("Cannot bind Argus socket");
+        }
+        if (fstatat(state.endpoint->directory.get(), "channel.sock", &info, AT_SYMLINK_NOFOLLOW) < 0) throw std::runtime_error("Cannot inspect bound socket");
+        state.device = info.st_dev;
+        state.inode = info.st_ino;
+        if (chmod(state.endpoint->path.c_str(), 0600) < 0 || listen(state.listener.get(), 16) < 0) throw std::runtime_error("Cannot listen on Argus socket");
+        state.running = true;
+        state.thread = std::thread([&state] { state.run(); });
+        return true;
+    } catch (const std::exception& error) {
+        std::cerr << "Argus socket setup: " << error.what() << '\n';
+        state.running = false;
+        return false;
+    }
+}

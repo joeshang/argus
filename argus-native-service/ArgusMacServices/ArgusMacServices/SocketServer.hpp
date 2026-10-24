@@ -1,41 +1,20 @@
-//
-//  SocketServer.hpp
-//  ArgusMacServices
-//
-//  Created by Chuanren Shang on 2022/12/4.
-//
+#pragma once
 
-#ifndef SocketServer_hpp
-#define SocketServer_hpp
-
-#include <cstdio>
+#include <functional>
+#include <memory>
 #include <string>
-#include <unistd.h>
-#include <dispatch/dispatch.h>
 
-class BrowserMonitor;
-
+// Owns a single I/O thread. Destruction joins it before releasing descriptors or
+// the callback, so no event can reach a destroyed monitor.
 class SocketServer {
 public:
-    SocketServer(std::function<void(std::string &)> handle): m_handleMessage(handle) {}
-    ~SocketServer() {
-        if (m_socket != -1) {
-            close(m_socket);
-        }
-        if (m_acceptSource) {
-            dispatch_release(m_acceptSource);
-        }
-    }
-
-    void setup();
-    void sendMessage(std::string &message, int fd);
+    explicit SocketServer(std::function<void(const std::string&)> handle);
+    ~SocketServer();
+    SocketServer(const SocketServer&) = delete;
+    SocketServer& operator=(const SocketServer&) = delete;
+    bool setup();
 
 private:
-    void receiveClientData(int fd);
-
-    int m_socket = -1;
-    dispatch_source_t m_acceptSource = NULL;
-    std::function<void(std::string &)> m_handleMessage;
+    struct State;
+    std::unique_ptr<State> m_state;
 };
-
-#endif /* SocketServer_hpp */

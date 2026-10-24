@@ -14,34 +14,23 @@
 #include <ftxui/screen/color_info.hpp>
 #include <ftxui/screen/terminal.hpp>
 
-void TerminalDisplayer::showMetrics(std::vector<ChromiumProcessInfo> chrome,
-                                    std::vector<ChromiumProcessInfo> edge,
-                                    std::vector<SafariProcessInfo> safari,
-                                    std::vector<WebMetricData> chromeWebMetric,
-                                    std::vector<WebMetricData> edgeWebMetric,
-                                    std::vector<WebMetricData> safariWebMetric) {
-    std::vector<PerfTableItem> chromePerf {};
-    for (const auto &info: chrome) {
-        chromePerf.push_back(PerfTableItem(info));
-    }
-    m_perfTableData["chrome"] = chromePerf;
-    m_webMetricTableData["chrome"] = chromeWebMetric;
-
-    std::vector<PerfTableItem> edgePerf {};
-    for (const auto &info: edge) {
-        edgePerf.push_back(PerfTableItem(info));
-    }
-    m_perfTableData["edge"] = edgePerf;
-    m_webMetricTableData["edge"] = edgeWebMetric;
-
-    std::vector<PerfTableItem> safariPerf {};
-    for (const auto &info: safari) {
-        safariPerf.push_back(PerfTableItem(info));
-    }
-    m_perfTableData["safari"] = safariPerf;
-    m_webMetricTableData["safari"] = safariWebMetric;
-
-    m_screen.Post(Event::Custom);
+void TerminalDisplayer::showMetrics(BrowserSnapshot snapshot) {
+    // Post owns the snapshot. Table state is only touched by the UI loop,
+    // including updates; posting a mere redraw event would leave a data race.
+    m_screen.Post(Closure([this, data = std::move(snapshot)]() mutable {
+        auto table = [](const auto& processes) {
+            std::vector<PerfTableItem> result;
+            for (const auto& info : processes) result.emplace_back(info);
+            return result;
+        };
+        m_perfTableData["chrome"] = table(data.chrome);
+        m_perfTableData["edge"] = table(data.edge);
+        m_perfTableData["safari"] = table(data.safari);
+        m_webMetricTableData["chrome"] = std::move(data.chromeWebMetric);
+        m_webMetricTableData["edge"] = std::move(data.edgeWebMetric);
+        m_webMetricTableData["safari"] = std::move(data.safariWebMetric);
+        m_screen.Post(Event::Custom);
+    }));
 }
 
 void TerminalDisplayer::loop() {
@@ -53,7 +42,7 @@ void TerminalDisplayer::loop() {
 
     std::vector<Component> renders {};
     for (const auto &name: browser_names) {
-        auto render = Renderer([&] {
+        auto render = Renderer([this, name] {
             std::string urlTitle = "Url";
             int urlMaxLength = 150;
             for (int i = 0; i < urlMaxLength; i++) {
@@ -115,7 +104,7 @@ void TerminalDisplayer::loop() {
     }
 
     for (const auto &name: browser_names) {
-        auto render = Renderer([&] {
+        auto render = Renderer([this, name] {
             std::string urlTitle = "Url";
             int urlMaxLength = 130;
             for (int i = 0; i < urlMaxLength; i++) {
@@ -135,7 +124,6 @@ void TerminalDisplayer::loop() {
             };
             std::vector<std::vector<std::string>> data = { titles };
             std::vector<int> alerts {};
-            int index = 1;
             for (const auto &info: m_webMetricTableData[name]) {
                 std::vector<std::string> item {};
                 item.push_back(std::to_string(info.webRequestDurationMs));
@@ -154,7 +142,6 @@ void TerminalDisplayer::loop() {
                 item.push_back(url);
                 data.push_back(item);
 
-                index++;
             }
 
             auto table = Table(data);

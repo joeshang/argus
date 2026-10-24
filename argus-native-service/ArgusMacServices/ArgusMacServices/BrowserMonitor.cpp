@@ -20,7 +20,8 @@
 
 #include <libproc.h>
 #include <mach/mach_time.h>
-#include <dispatch/dispatch.h>
+#include <chrono>
+#include <limits>
 #include <vector>
 #include <string>
 #include <sstream>
@@ -83,46 +84,87 @@ WebMetricData decodeMessage(nlohmann::json &json) {
     return data;
 }
 
-void BrowserMonitor::beginMetric(int interval,
-                                 std::function<void(void)> callback) {
-    m_sampleInterval = interval;
-    m_metricCallback = callback;
-
-    dispatch_queue_t queue = dispatch_get_global_queue(DISPATCH_QUEUE_PRIORITY_DEFAULT, 0);
-    dispatch_source_t timer = dispatch_source_create(DISPATCH_SOURCE_TYPE_TIMER, 0, 0, queue);
-    dispatch_set_context(timer, this);
-    dispatch_source_set_event_handler_f(timer, [](void *data) {
-        auto m = static_cast<BrowserMonitor *>(data);
-        m->queryBrowserProcesses();
-        m->fetchBrowserProcessUsage();
-        m->m_metricCallback();
-    });
-    dispatch_source_set_timer(timer, dispatch_time(DISPATCH_TIME_NOW, 0), interval * NSEC_PER_SEC, 0 * NSEC_PER_SEC);
-    dispatch_resume(timer);
+BrowserMonitor::~BrowserMonitor() {
+    stopMetric();
 }
 
-void BrowserMonitor::receiveMessage(std::string &message) {
-    auto json = nlohmann::json::parse(message, nullptr, false);
-    if (json.is_discarded()) {
-        return;
+void BrowserMonitor::stopMetric() {
+    {
+        std::lock_guard lock(m_mutex);
+        m_stopping = true;
     }
-    if (!json.contains("type")) {
-        return;
+    m_wakeup.notify_all();
+    if (m_sampler.joinable()) m_sampler.join();
+}
+
+void BrowserMonitor::beginMetric(int interval, std::function<void(BrowserSnapshot)> callback) {
+    if (interval <= 0 || !callback) throw std::invalid_argument("Invalid sampling interval or callback");
+    stopMetric();
+    {
+        std::lock_guard lock(m_mutex);
+        m_sampleInterval = interval;
+        m_stopping = false;
     }
-    if (!json.contains("browser")) {
-        return;
-    }
-    auto type = json["type"].get<std::string>();
-    auto browser = json["browser"].get<std::string>();
-    if (type == "tab") {
-        auto rendererClientId = json["rendererClientId"].get<int>();
-        auto info = decodeMessage(json);
-        if (browser == "chrome") {
-            m_chromeTabInfos[rendererClientId] = info;
-        } else if (browser == "edge") {
-            m_edgeTabInfos[rendererClientId] = info;
+    m_sampler = std::thread([this, interval, callback = std::move(callback)] {
+        std::unique_lock lock(m_mutex);
+        while (!m_stopping) {
+            queryBrowserProcesses();
+            fetchBrowserProcessUsage();
+            auto data = snapshotLocked();
+            // Never call UI/client code while holding the monitor state lock.
+            lock.unlock();
+            callback(std::move(data));
+            lock.lock();
+            m_wakeup.wait_for(lock, std::chrono::seconds(interval), [this] { return m_stopping; });
         }
+    });
+}
+
+BrowserSnapshot BrowserMonitor::snapshotLocked() const {
+    BrowserSnapshot result { m_chromeProcesses, m_edgeProcesses, m_safariProcesses, {}, {}, {} };
+    auto metrics = [](const auto& processes, const auto& tabs) {
+        std::vector<WebMetricData> values;
+        for (const auto& process : processes) {
+            const auto found = tabs.find(process.rendererClientId);
+            if (process.type == ChromiumProcessType::Tab && found != tabs.end() && found->second.withMetric) {
+                values.push_back(found->second);
+            }
+        }
+        return values;
+    };
+    result.chromeWebMetric = metrics(m_chromeProcesses, m_chromeTabInfos);
+    result.edgeWebMetric = metrics(m_edgeProcesses, m_edgeTabInfos);
+    return result;
+}
+
+BrowserSnapshot BrowserMonitor::snapshot() const {
+    std::lock_guard lock(m_mutex);
+    return snapshotLocked();
+}
+
+void BrowserMonitor::receiveMessage(const std::string& message) {
+    auto json = nlohmann::json::parse(message, nullptr, false);
+    if (!json.is_object() || !json.contains("type") || json["type"] != "tab" ||
+        !json.contains("browser") || !json["browser"].is_string() ||
+        !json.contains("rendererClientId") || !json["rendererClientId"].is_number_integer() ||
+        json["rendererClientId"] <= 0 || json["rendererClientId"] > std::numeric_limits<int>::max()) return;
+    const auto browser = json["browser"].get<std::string>();
+    if (browser != "chrome" && browser != "edge") return;
+    if (json.contains("url") && !json["url"].is_string()) return;
+    for (const auto* key : { "isSubframe", "withMetric" }) {
+        if (json.contains(key) && !json[key].is_boolean()) return;
     }
+    for (const auto* key : { "webRequestDurationMs", "pageLoadTotalDurationMs", "pageLoadNetworkDurationMs",
+            "pageLoadRenderDurationMs", "requestCount", "httpStatusCount2xx", "httpStatusCount3xx",
+            "httpStatusCount4xx", "httpStatusCount5xx" }) {
+        if (json.contains(key) && (!json[key].is_number_integer() || json[key] < 0 ||
+            json[key] > std::numeric_limits<int>::max())) return;
+    }
+    const auto rendererClientId = json["rendererClientId"].get<int>();
+    auto info = decodeMessage(json);
+    std::lock_guard lock(m_mutex);
+    auto& tabs = browser == "chrome" ? m_chromeTabInfos : m_edgeTabInfos;
+    tabs[rendererClientId] = std::move(info);
 }
 
 void BrowserMonitor::queryBrowserProcesses() {
@@ -148,8 +190,8 @@ void BrowserMonitor::queryBrowserProcesses() {
     pid_t edgeId = 0;
     pid_t safariId = 0;
     for (auto &pid: pids) {
-        char buffer[MAXPATHLEN];
-        proc_name(pid, buffer, sizeof(buffer));
+        char buffer[MAXPATHLEN] {};
+        if (proc_name(pid, buffer, sizeof(buffer)) <= 0) continue;
         std::string name = buffer;
         if (name == s_chromeProcess) {
             chromeId = pid;
@@ -173,8 +215,8 @@ void BrowserMonitor::queryBrowserProcesses() {
     }
 
     for (auto &pid: pids) {
-        char buffer[MAXPATHLEN];
-        proc_name(pid, buffer, sizeof(buffer));
+        char buffer[MAXPATHLEN] {};
+        if (proc_name(pid, buffer, sizeof(buffer)) <= 0) continue;
         std::string name = buffer;
 
         // Other apps which use WebKit will have the same name of com.apple.WebKit.WebContent
@@ -255,6 +297,7 @@ void BrowserMonitor::fetchBrowserProcessUsage() {
 }
 
 void BrowserMonitor::printUsage() {
+    std::lock_guard lock(m_mutex);
     std::cout << "============ Chrome ===========\n"
     << std::fixed << std::setw(10) << "pid" << "\t"
     << std::fixed << std::setw(10) << "cpu" << "\t"
@@ -294,13 +337,14 @@ void BrowserMonitor::printUsage() {
 
 UsageData BrowserMonitor::getProcessUsage(pid_t pid) {
     UsageData data {};
-    struct rusage_info_v2 rusage_info_data;
-    proc_pid_rusage(pid, RUSAGE_INFO_V2, (rusage_info_t *)&rusage_info_data);
+    struct rusage_info_v2 rusage_info_data {};
+    if (proc_pid_rusage(pid, RUSAGE_INFO_V2, (rusage_info_t *)&rusage_info_data) != 0) return data;
     data.memoryUsage = rusage_info_data.ri_phys_footprint;
-    static mach_timebase_info_data_t timebase;
-    if (timebase.denom == 0) {
-      mach_timebase_info(&timebase);
-    }
+    static const auto timebase = [] {
+        mach_timebase_info_data_t value {};
+        mach_timebase_info(&value);
+        return value;
+    }();
     data.cpuTime = (rusage_info_data.ri_user_time + rusage_info_data.ri_system_time) * timebase.numer / timebase.denom;
     uint64_t prevCpuTime = 0;
     if (m_prevUsage.contains(pid)) {

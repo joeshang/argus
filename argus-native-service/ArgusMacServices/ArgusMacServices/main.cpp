@@ -1,47 +1,23 @@
-//
-//  main.cpp
-//  ArgusMacServices
-//
-//  Created by Chuanren Shang on 2022/11/25.
-//
-
 #include <iostream>
-#include <cstdio>
-#include <dispatch/dispatch.h>
-#include <CoreFoundation/CFRunLoop.h>
 
 #include "BrowserMonitor.hpp"
 #include "SocketServer.hpp"
 #include "TerminalDisplayer.hpp"
 
-void signalCallbackHandler(int signum) {
-    CFRunLoopStop(CFRunLoopGetCurrent());
-}
-
-int main(int argc, const char * argv[]) {
-    signal(SIGINT, signalCallbackHandler);
-    signal(SIGTERM, signalCallbackHandler);
-
-    std::cout << "Argus Native Service\n";
-    std::cout << "start working...\n\n";
-
-    auto monitor = std::make_unique<BrowserMonitor>();
-    auto server = std::make_unique<SocketServer>([&monitor](std::string &message) {
-        monitor->receiveMessage(message);
+int main() {
+    std::cout << "Argus Native Service\nstart working...\n\n";
+    // Destruction order: stop socket callbacks, join the sampler, then destroy
+    // the UI. No producer can post into a destroyed screen or monitor.
+    TerminalDisplayer displayer;
+    BrowserMonitor monitor;
+    SocketServer server([&monitor](const std::string& message) {
+        monitor.receiveMessage(message);
     });
-    server->setup();
-
-    auto displayer = std::make_unique<TerminalDisplayer>();
-    monitor->beginMetric(2, [&displayer, &monitor]() {
-        displayer->showMetrics(monitor->getChromeProcessInfo(),
-                               monitor->getEdgeProcessInfo(),
-                               monitor->getSafariProcessInfo(),
-                               monitor->getChromeWebMetric(),
-                               monitor->getEdgeWebMetric(),
-                               monitor->getSafariWebMetric());
+    if (!server.setup()) return EXIT_FAILURE;
+    monitor.beginMetric(2, [&displayer](BrowserSnapshot snapshot) {
+        displayer.showMetrics(std::move(snapshot));
     });
-
-    displayer->loop();
-
-    return 0;
+    displayer.loop();
+    monitor.stopMetric();
+    return EXIT_SUCCESS;
 }

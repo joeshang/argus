@@ -47,12 +47,7 @@ public:
     TerminalDisplayer():m_screen(ScreenInteractive::Fullscreen()) {}
 
     void loop();
-    void showMetrics(std::vector<ChromiumProcessInfo> chrome,
-                     std::vector<ChromiumProcessInfo> edge,
-                     std::vector<SafariProcessInfo> safari,
-                     std::vector<WebMetricData> chromeWebMetric,
-                     std::vector<WebMetricData> edgeWebMetric,
-                     std::vector<WebMetricData> safariWebMetric);
+    void showMetrics(BrowserSnapshot snapshot);
 
 private:
     ScreenInteractive m_screen;

@@ -1,105 +1,97 @@
-//
-//  main.cpp
-//  ArgusMacExtensionHelper
-//
-//  Created by Chuanren Shang on 2022/11/29.
-//
+#include "../../../native-common/Framing.hpp"
+#include "../../../native-common/LocalSocket.hpp"
 
+#include <csignal>
+#include <chrono>
 #include <iostream>
-#include <cstdio>
-#include <sys/socket.h>
-#include <sys/un.h>
-#include <sys/types.h>
-#include <sys/stat.h>
-#include <dispatch/dispatch.h>
-#include <CoreFoundation/CFRunLoop.h>
 #include <nlohmann/json.hpp>
+#include <poll.h>
 
-static const char *socket_path = "/tmp/com.argus.channel";
-static int client_socket = 0;
+namespace {
 
-void sendMessageToExtension(nlohmann::json content) {
-    std::string encoded_content = content.dump();
-    uint32_t size = (uint32_t)encoded_content.length();
-    char* length = reinterpret_cast<char*>(&size);
-    fwrite(length, 4, sizeof(char), stdout);
-    fwrite(encoded_content.c_str(), encoded_content.length(), sizeof(char), stdout);
-    fflush(stdout);
+int bridge(int fd) {
+    argus::FrameDecoder browserInput, serviceInput;
+    argus::FrameWriter toService, toBrowser;
+    bool browserClosed = false;
+    std::chrono::steady_clock::time_point drainDeadline;
+    char buffer[8192];
+    for (;;) {
+        pollfd descriptors[] = {
+            { browserClosed ? -1 : STDIN_FILENO, POLLIN, 0 },
+            { fd, short(POLLIN | (toService.pending() ? POLLOUT : 0)), 0 },
+            { STDOUT_FILENO, short(toBrowser.pending() ? POLLOUT : 0), 0 },
+        };
+        const auto timeout = browserClosed ? std::chrono::duration_cast<std::chrono::milliseconds>(
+            drainDeadline - std::chrono::steady_clock::now()).count() : -1;
+        if (browserClosed && timeout <= 0) return EXIT_FAILURE;
+        const int result = poll(descriptors, 3, static_cast<int>(timeout));
+        if (result < 0 && errno == EINTR) continue;
+        if (result <= 0) return EXIT_FAILURE;
+        for (int source = 0; source < 2; ++source) {
+            if (!(descriptors[source].revents & (POLLIN | POLLHUP))) continue;
+            auto& decoder = source == 0 ? browserInput : serviceInput;
+            const auto count = read(descriptors[source].fd, buffer, sizeof(buffer));
+            if (count > 0) {
+                bool queued = true;
+                const bool valid = decoder.feed(buffer, static_cast<size_t>(count), [&](const std::string& message) {
+                    if (source == 0) queued = queued && toService.append(message);
+                    else queued = queued && toBrowser.append(nlohmann::json(message).dump());
+                });
+                if (!valid || !queued) {
+                    std::cerr << "Argus Helper: invalid frame or slow consumer\n";
+                    return EXIT_FAILURE;
+                }
+            } else if (count == 0) {
+                if (!decoder.complete()) {
+                    std::cerr << "Argus Helper: truncated frame at EOF\n";
+                    return EXIT_FAILURE;
+                }
+                if (source == 1) {
+                    std::cerr << "Argus Helper: Native Service disconnected\n";
+                    return EXIT_FAILURE; // Close stdio so Chrome can reconnect.
+                }
+                browserClosed = true;
+                drainDeadline = std::chrono::steady_clock::now() + std::chrono::seconds(2);
+            } else if (errno != EINTR && errno != EAGAIN && errno != EWOULDBLOCK) return EXIT_FAILURE;
+        }
+        if (!toService.flush(fd) || !toBrowser.flush(STDOUT_FILENO)) return EXIT_FAILURE;
+        if (browserClosed && toService.pending() == 0) return EXIT_SUCCESS;
+        if (descriptors[2].revents & POLLHUP) return EXIT_FAILURE;
+        for (const auto& descriptor : descriptors) {
+            if (descriptor.revents & (POLLERR | POLLNVAL)) return EXIT_FAILURE;
+        }
+    }
 }
 
-void connectNativeService() {
-    if ((client_socket = socket(AF_UNIX, SOCK_STREAM, 0)) == -1) {
-        std::cerr << "socket failed\n";
-        return;
-    }
+} // namespace
 
-    struct sockaddr_un remote;
-    remote.sun_family = AF_UNIX;
-    strcpy(remote.sun_path, socket_path);
-    if (connect(client_socket, (struct sockaddr *)&remote, sizeof(remote)) == -1) {
-        std::cerr << "connect failed\n";
-        return;
-    }
-
-    // cerr for debug for native messaging's host
-    std::cerr << "connected!\n";
-
-    dispatch_source_t sockSource = dispatch_source_create(DISPATCH_SOURCE_TYPE_READ, client_socket, 0, dispatch_get_main_queue());
-
-    dispatch_source_set_event_handler(sockSource, ^{
-        char raw_length[4];
-        memset(raw_length, 0, 4);
-        size_t recv_len = recv(client_socket, raw_length, 4, 0);
-        if (recv_len <= 0) {
-            dispatch_cancel(sockSource);
-            return;
+int main() {
+    // SO_NOSIGPIPE covers the UDS; ignoring SIGPIPE also handles a closed browser
+    // stdout pipe. Errors propagate through flush(), producing an ordinary exit.
+    std::signal(SIGPIPE, SIG_IGN);
+    try {
+        auto endpoint = argus::LocalEndpoint::open();
+        argus::UniqueFd fd(socket(AF_UNIX, SOCK_STREAM, 0));
+        if (fd.get() < 0) throw std::runtime_error("Cannot create socket");
+        argus::noSigPipe(fd.get());
+        argus::nonblocking(fd.get());
+        if (connect(fd.get(), reinterpret_cast<const sockaddr*>(&endpoint.address), sizeof(sockaddr_un)) < 0) {
+            if (errno != EINPROGRESS) throw std::runtime_error("Cannot connect to Native Service");
+            pollfd connecting { fd.get(), POLLOUT, 0 };
+            int result;
+            do { result = poll(&connecting, 1, 2000); } while (result < 0 && errno == EINTR);
+            int error = 0;
+            socklen_t length = sizeof(error);
+            if (result <= 0 || getsockopt(fd.get(), SOL_SOCKET, SO_ERROR, &error, &length) < 0 || error != 0) {
+                throw std::runtime_error("Cannot connect to Native Service");
+            }
         }
-        uint32_t message_length = *reinterpret_cast<uint32_t*>(raw_length);
-        if (!message_length) {
-            exit(EXIT_SUCCESS);
-        };
-
-        char message[message_length];
-        recv_len = recv(client_socket, message, message_length, 0);
-        if (recv_len <= 0) {
-            dispatch_cancel(sockSource);
-            return;
-        }
-        std::string m(message, message + sizeof(message) / sizeof(message[0]));
-        sendMessageToExtension(m);
-    });
-    dispatch_source_set_cancel_handler(sockSource, ^{
-        std::cerr << "server closed" << "\n";
-        close(client_socket);
-        dispatch_release(sockSource);
-    });
-    dispatch_resume(sockSource);
-}
-
-int main(int argc, const char * argv[]) {
-    connectNativeService();
-
-    dispatch_source_t input = dispatch_source_create(DISPATCH_SOURCE_TYPE_READ, STDIN_FILENO, 0, dispatch_get_main_queue());
-    dispatch_source_set_event_handler(input, ^{
-        int length_size = 4;
-        char raw_length_buffer[length_size];
-        memset(raw_length_buffer, 0, length_size);
-        fread(raw_length_buffer, length_size, sizeof(char), stdin);
-        uint32_t message_length = *reinterpret_cast<uint32_t*>(raw_length_buffer);
-        if (!message_length) {
-            exit(EXIT_SUCCESS);
-        };
-
-        int buffer_size = length_size + message_length;
-        char message[buffer_size];
-        memcpy(message, raw_length_buffer, length_size);
-        fread(message + length_size, message_length, sizeof(char), stdin);
-
-        send(client_socket, message, buffer_size, 0);
-    });
-    dispatch_resume(input);
-
-    CFRunLoopRun();
-
-    return 0;
+        if (!argus::sameUser(fd.get())) throw std::runtime_error("Native Service belongs to a different user");
+        argus::nonblocking(STDIN_FILENO);
+        argus::nonblocking(STDOUT_FILENO);
+        return bridge(fd.get());
+    } catch (const std::exception& error) {
+        std::cerr << "Argus Helper: " << error.what() << '\n';
+        return EXIT_FAILURE;
+    }
 }

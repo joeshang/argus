@@ -1,77 +1,32 @@
-"use strict";
-
-(function () {
-
-var uABrowserObject;
-if (typeof browser !== 'undefined')
-{
-   var isFirefox = true;
-   uABrowserObject = browser;
-}
-else if (window.chrome)
-{
-   var isChrome = true;
-   uABrowserObject = window.chrome;
-}
-else
-{
-   throw "Browser detection: unsupported browser: " + window.navigator.userAgent;
-}
-
-var requestId = 0;
-
-uABrowserObject.runtime.onMessage.addListener (function (message, sender, sendResponse)
-{
-   if (requestId > 0)
-      return;
-
-      requestId = message.requestId;
-
-      getPageLoadTimings ();
-});
-
-
-if (document.readyState == "complete")
-{
-   getPageLoadTimings ();
-}
-else
-{
-   window.addEventListener ("load", getPageLoadTimings);
-}
-
-function getPageLoadTimings ()
-{
-   if (! requestId)
-      return;
-   if (document.readyState != "complete")
-      return;
-
-   setTimeout (function()
-   {
-      var timingInfo = performance.timing;
-
-      if (timingInfo.loadEventEnd == 0)
-      {
-         return;
-      }
-
-      var message = { requestId: requestId };
-      message.startTimeMs = timingInfo.navigationStart;
-
-      message.pageLoadTotalMs = timingInfo.loadEventEnd - timingInfo.navigationStart;
-
-      var networkStartMs = timingInfo.redirectStart == 0 ? timingInfo.fetchStart : timingInfo.redirectStart;
-      message.pageLoadNetworkMs = timingInfo.responseEnd - networkStartMs;
-      if (message.pageLoadNetworkMs <= 0)
-      {
-         return;
-      }
-
-      message.pageLoadRenderMs = timingInfo.loadEventEnd - timingInfo.responseEnd;
-
-      uABrowserObject.runtime.sendMessage (message);
-
-   }, 0);
-}
-} ());
+(() => {
+  // Static, top-frame-only injection runs once per document, independently of
+  // the number of HTTP requests. No request bodies or page scripts are read.
+  let sent = false;
+  function report() {
+    if (sent) return;
+    const timing = performance.getEntriesByType('navigation')[0];
+    if (!timing || timing.loadEventEnd <= 0) return;
+    sent = true;
+    const networkStart = timing.redirectStart || timing.fetchStart;
+    try {
+      void chrome.runtime.sendMessage({
+        type: 'argus:page-load',
+        pageLoadTotalMs: Math.max(0, timing.loadEventEnd - timing.startTime),
+        pageLoadNetworkMs: Math.max(0, timing.responseEnd - networkStart),
+        pageLoadRenderMs: Math.max(0, timing.loadEventEnd - timing.responseEnd),
+      }).catch(() => {});
+    } catch {
+      // Reloading/uninstalling the extension can also throw synchronously.
+    }
+  }
+  // loadEventEnd is populated after the load callback returns. A queued task
+  // also covers content scripts installed after a document has already loaded.
+  if (document.readyState === 'complete') setTimeout(report, 0);
+  else window.addEventListener('load', () => setTimeout(report, 0), { once: true });
+  window.addEventListener('pageshow', event => {
+    if (event.persisted) {
+      sent = false;
+      setTimeout(report, 0);
+    }
+  });
+})();

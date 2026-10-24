@@ -1,260 +1,300 @@
-"use strict";
+import { NativeConnection } from './NativeConnection.js';
 
-function MonitoringService(eventSource) {
-  eventSource.register(this);
-  this.sendDataTimer = 2 * 1000;
-  this._monitorEnabled = true;
-  this._excludedUrlPatterns = [];
-  this._tabSessionMap = {};
-  this._tabHostMap = {};
-  this._openRequests = {};
+export const HEARTBEAT = 'argus-heartbeat';
+const SESSION_KEY = 'tabSessions';
+const REQUEST_TTL_MS = 5 * 60 * 1000;
+const MAX_OPEN_REQUESTS = 10000;
+const METRIC_FIELDS = [
+  'httpStatusCount2xx', 'httpStatusCount3xx', 'httpStatusCount4xx',
+  'httpStatusCount5xx', 'requestCount', 'webRequestDurationMs',
+  'pageLoadTotalDurationMs', 'pageLoadNetworkDurationMs', 'pageLoadRenderDurationMs',
+];
+
+function newSession(url, documentId = null) {
+  return { url, documentId, documents: {}, navigationRequestId: null,
+    ...Object.fromEntries(METRIC_FIELDS.map(key => [key, 0])) };
 }
 
-var updateData = new Map(), timer;
-
-chrome.runtime.onMessage.addListener(contentScriptMessagingOnMessage);
-
-function contentScriptMessagingOnMessage(message, sender, sendResponse) {
-  if (!message.requestId) {
-    return;
-  }
-
-  let requestType;
-  //   if (sender.frameId == 0) requestType = ProtocolWebRequestTypes.MainFrame;
-  //   else requestType = ProtocolWebRequestTypes.SubFrame;
-  let tabId = sender.tab.id;
-  updateData.set(tabId, {
-    total: message.pageLoadTotalMs,
-    network: message.pageLoadNetworkMs,
-    render: message.pageLoadRenderMs,
-  });
+function monitoredURL(url) {
+  return typeof url === 'string' && /^https?:\/\//i.test(url) &&
+    !/^https?:\/\/[^/]*google\.[^/]+\/_\/chrome\/newtab(?:[/?#]|$)/i.test(url);
 }
 
-MonitoringService.prototype.getBrowser = function () {
-  var browserName = "unknown";
-  for (const brand of navigator.userAgentData.brands) {
-    let brandName = brand.brand;
-    if (brandName == "Google Chrome") {
-      browserName = "chrome";
-      break;
-    } else if (brandName == "Microsoft Edge") {
-      browserName = "edge";
-      break;
+export class MonitoringService {
+  constructor(api, userAgent = globalThis.navigator) {
+    this.api = api;
+    this.userAgent = userAgent;
+    this.enabled = false;
+    this.sessions = new Map();
+    this.requests = new Map();
+    this.navigations = new Map();
+    this.timer = null;
+    this.collecting = false;
+    this.browser = 'unknown';
+    this.OS = 'unknown';
+    this.native = new NativeConnection(api, () => this.connectionChanged());
+    // Event handlers may run before storage hydration. Queue those events so a
+    // worker restart never replaces a fresh navigation with an old checkpoint.
+    this.pendingEvents = [];
+  }
+
+  async start() {
+    const [settings, checkpoint, platform] = await Promise.all([
+      this.api.storage.local.get('monitorEnabled'),
+      this.api.storage.session.get(SESSION_KEY),
+      this.api.runtime.getPlatformInfo(),
+    ]);
+    const brands = this.userAgent?.userAgentData?.brands || [];
+    const ua = this.userAgent?.userAgent || '';
+    this.browser = brands.some(item => item.brand === 'Microsoft Edge') || /Edg\//.test(ua)
+      ? 'edge' : brands.some(item => item.brand === 'Google Chrome') || /Chrome\//.test(ua)
+        ? 'chrome' : 'unknown';
+    this.OS = ({ mac: 'macOS', win: 'Windows', linux: 'Linux', cros: 'Chrome OS' })[platform.os] || platform.os;
+    this.enabled = settings.monitorEnabled !== false;
+    this.sessions = new Map(Object.entries(checkpoint[SESSION_KEY] || {}).map(([id, value]) => [Number(id), value]));
+    const events = this.pendingEvents;
+    this.pendingEvents = null;
+    for (const apply of events) apply();
+    await this.ensureAlarm();
+    this.native.enabled = this.enabled;
+    this.native.connect();
+  }
+
+  async ensureAlarm() {
+    if (!await this.api.alarms.get(HEARTBEAT)) {
+      await this.api.alarms.create(HEARTBEAT, { periodInMinutes: 0.5 });
     }
   }
-  return browserName;
-};
 
-MonitoringService.prototype.getOS = function () {
-  return navigator.userAgentData.platform;
-};
-
-MonitoringService.prototype.isEnabled = function () {
-  return this._monitorEnabled;
-};
-
-MonitoringService.prototype.addExcludedUrlPattern = function (regExp) {
-  this._excludedUrlPatterns.push(regExp);
-};
-
-MonitoringService.prototype.toBeExcluded = function (url) {
-  for (var i = 0; i < this._excludedUrlPatterns.length; i++) {
-    var excludedPattern = this._excludedUrlPatterns[i];
-    if (url.search(excludedPattern) >= 0) return true;
-  }
-  return false;
-};
-
-MonitoringService.prototype.shouldBeMonitored = function (requestID) {
-  return this._monitorEnabled && requestID in this._openRequests;
-};
-
-MonitoringService.prototype.onRequest = function (details) {
-  var requestID = details.requestId;
-  if (this._monitorEnabled && !this.toBeExcluded(details.url)) {
-    this._openRequests[requestID] = { request: details };
-  }
-};
-
-MonitoringService.prototype.onRequestCompleted = function (details) {
-  var requestID = details.requestId;
-  if (this.shouldBeMonitored(requestID)) {
-    var request = this._openRequests[requestID].request;
-    this._archiveRequest(details, request, requestID);
-    delete this._openRequests[requestID];
-  }
-};
-
-MonitoringService.prototype._archiveRequest = function (
-  details,
-  request,
-  reqeustId
-) {
-  var startTime = request.timeStamp,
-    endTime = details.timeStamp,
-    duringTime = endTime - startTime,
-    statusCode = details.statusCode,
-    tabId = "tab-" + details.tabId;
-
-  if (this._tabSessionMap[tabId] === undefined) {
-    this._tabSessionMap[tabId] = {
-      httpStatusCount2xx: 0,
-      httpStatusCount3xx: 0,
-      httpStatusCount4xx: 0,
-      httpStatusCount5xx: 0,
-      requestCount: 0,
-      webRequestDurationMs: 0, // duration for host
-      pageLoadTotalDurationMs: 0,
-      pageLoadNetworkDurationMs: 0,
-      pageLoadRenderDurationMs: 0,
-    };
-  }
-  //   var urls = this._tabSessionMap.tabs[tabId].urls;
-  //   urls.push(obj);
-  //   this._tabSessionMap.tabs[tabId].urls = urls;
-  this._tabSessionMap[tabId].requestCount++;
-  if (details.type === "main_frame") {
-    this._tabSessionMap[tabId].webRequestDurationMs = Math.floor(duringTime);
+  connectionChanged() {
+    clearInterval(this.timer);
+    this.timer = null;
+    if (this.enabled && this.native.port) {
+      void this.collect().catch(error => console.warn('Argus collection failed:', error));
+      this.timer = setInterval(() => {
+        void this.collect().catch(error => console.warn('Argus collection failed:', error));
+      }, 2000);
+    }
   }
 
-  if (199 < statusCode && statusCode < 300) {
-    this._tabSessionMap[tabId].httpStatusCount2xx++;
-  }
-  if (299 < statusCode && statusCode < 400) {
-    this._tabSessionMap[tabId].httpStatusCount3xx++;
-  }
-  if (399 < statusCode && statusCode < 500) {
-    this._tabSessionMap[tabId].httpStatusCount4xx++;
-  }
-  if (499 < statusCode && statusCode < 600) {
-    this._tabSessionMap[tabId].httpStatusCount5xx++;
+  async heartbeat() {
+    if (!this.enabled) return;
+    this.native.connect();
+    await this.collect();
   }
 
-  if (this.getBrowser() === "chrome" || this.getBrowser() === "edge") {
-    chrome.tabs.executeScript(
-      details.tabId,
-      { file: "content.js" },
-      function () {
-        chrome.tabs.sendMessage(
-          details.tabId,
-          { requestId: reqeustId },
-          { frameId: 0 }
-        );
+  async setEnabled(enabled) {
+    await this.api.storage.local.set({ monitorEnabled: enabled });
+    this.enabled = enabled;
+    if (enabled) {
+      this.native.enabled = true;
+      this.native.connect();
+    } else {
+      this.native.stop();
+      this.requests.clear();
+      this.navigations.clear();
+      this.sessions.clear();
+      await this.save();
+    }
+    return this.status();
+  }
+
+  status() {
+    return { enabled: this.enabled, connected: Boolean(this.native.port),
+      error: this.native.error, browser: this.browser, OS: this.OS };
+  }
+
+  defer(apply) {
+    if (this.pendingEvents) {
+      this.pendingEvents.push(apply);
+      return true;
+    }
+    return false;
+  }
+
+  onRequest(details) {
+    if (this.defer(() => this.onRequest(details))) return;
+    if (!this.enabled || details.tabId < 0 || !monitoredURL(details.url)) return;
+    let session = this.sessions.get(details.tabId);
+    if (details.type === 'main_frame') {
+      const previous = this.requests.get(details.requestId);
+      if (previous) {
+        previous.session.url = details.url;
+        return; // Redirects keep the original start time and request counter.
       }
-    );
-  }
-};
-
-MonitoringService.prototype.reset = function () {
-  this._openRequests = {};
-  this._tabSessionMap = {};
-};
-
-MonitoringService.prototype.update = function (data) {
-  if (data.size === 0) {
-    console.log("No need to update page load data");
-    return;
-  } else {
-    for (let id of data.keys()) {
-      var tabId = "tab-" + id;
-      if (this._tabSessionMap[tabId]) {
-        this._tabSessionMap[tabId].pageLoadTotalDurationMs = data.get(id).total;
-        this._tabSessionMap[tabId].pageLoadNetworkDurationMs =
-          data.get(id).network;
-        this._tabSessionMap[tabId].pageLoadRenderDurationMs =
-          data.get(id).render;
+      // webRequest and webNavigation have no defined ordering. Keep pending
+      // navigation data separate until commit, and adopt an unmatched commit
+      // when the network event arrives later.
+      if (!session?.awaitingRequest || session.url !== details.url) {
+        session = newSession(details.url);
       }
+      session.awaitingRequest = false;
+      session.navigationRequestId = details.requestId;
+      session.startedAt = details.timeStamp;
+      this.navigations.set(details.tabId, session);
+    } else if (!session && details.frameId === 0 && details.documentId) {
+      session = newSession('', details.documentId);
+      this.sessions.set(details.tabId, session);
+    }
+    if (!session) return;
+    if (details.type !== 'main_frame' && details.documentId) {
+      const documents = [session.documentId, ...Object.values(session.documents || {})];
+      if (!documents.includes(details.documentId) && !documents.includes(details.parentDocumentId)) return;
+    }
+    // Bound memory even for requests that never complete (streams, cancelled tabs).
+    if (this.requests.size >= MAX_OPEN_REQUESTS) this.pruneRequests(Date.now());
+    if (this.requests.size >= MAX_OPEN_REQUESTS) this.requests.delete(this.requests.keys().next().value);
+    if (!this.requests.has(details.requestId)) {
+      this.requests.set(details.requestId, { session, tabId: details.tabId,
+        start: details.timeStamp, type: details.type });
     }
   }
-};
 
-MonitoringService.prototype.query_tab = function () {
-  chrome.tabs.query({}, (tabs) => {
-    for (const tab of tabs) {
-      chrome.webNavigation.getAllFrames(
-        {
-          tabId: tab.id,
-        },
-        (frames) => {
-          if (chrome.runtime.lastError) {
-            return;
-          }
-          var topFrameProcessId = 0;
-          for (var i = 0; i < frames.length; i++) {
-            var frame = frames[i];
-            // The top-level frame has frame ID 0.
-            if (frame.frameId === 0) {
-              topFrameProcessId = frame.processId;
-              var tabId = "tab-" + tab.id;
-              if (this._tabSessionMap[tabId]) {
-                var sessionInfo = this._tabSessionMap[tabId];
-                this.port.postMessage({
-                  browser: this.getBrowser(),
-                  OS: this.getOS(),
-                  type: "tab",
-                  isSubframe: false,
-                  url: frame.url,
-                  rendererClientId: frame.processId,
-                  withMetric: true,
-                  httpStatusCount2xx: sessionInfo.httpStatusCount2xx,
-                  httpStatusCount3xx: sessionInfo.httpStatusCount3xx,
-                  httpStatusCount4xx: sessionInfo.httpStatusCount4xx,
-                  httpStatusCount5xx: sessionInfo.httpStatusCount5xx,
-                  requestCount: sessionInfo.requestCount,
-                  webRequestDurationMs: sessionInfo.webRequestDurationMs,
-                  pageLoadTotalDurationMs: sessionInfo.pageLoadTotalDurationMs,
-                  pageLoadNetworkDurationMs: sessionInfo.pageLoadNetworkDurationMs,
-                  pageLoadRenderDurationMs: sessionInfo.pageLoadRenderDurationMs,
-                });
-              } else {
-                this.port.postMessage({
-                  browser: this.getBrowser(),
-                  OS: this.getOS(),
-                  type: "tab",
-                  isSubframe: false,
-                  url: frame.url,
-                  rendererClientId: frame.processId
-                });
-              }
-            } else if (frame.processId !== topFrameProcessId) {
-              this.port.postMessage({
-                browser: this.getBrowser(),
-                OS: this.getOS(),
-                type: "tab",
-                isSubframe: true,
-                url: frame.url,
-                rendererClientId: frame.processId
-              });
-            }
-          }
-        }
-      );
+  onCompleted(details) {
+    if (this.defer(() => this.onCompleted(details))) return;
+    const request = this.requests.get(details.requestId);
+    this.requests.delete(details.requestId);
+    if (!this.enabled || !request || (this.sessions.get(details.tabId) !== request.session &&
+        this.navigations.get(details.tabId) !== request.session)) return;
+    const session = request.session;
+    session.requestCount++;
+    const statusClass = Math.floor(details.statusCode / 100);
+    if (statusClass >= 2 && statusClass <= 5) session[`httpStatusCount${statusClass}xx`]++;
+    if (request.type === 'main_frame') {
+      session.webRequestDurationMs = Math.max(0, Math.floor(details.timeStamp - request.start));
     }
-  });
-};
-
-
-MonitoringService.prototype.sendCollectData = function () {
-  this.port = chrome.runtime.connectNative("com.argus.extension.helper");
-  this.port.onDisconnect.addListener(function () {
-    console.log("Disconnected");
-  });
-  this.port.onMessage.addListener((response) => {
-    console.log(`Received from NativeService: ${JSON.stringify(response)}`);
-  });
-  if (JSON.stringify(this._tabSessionMap) !== "{}") {
-    this.update(updateData);
   }
-  this.query_tab();
-  timer = setInterval(() => {
-    if (JSON.stringify(this._tabSessionMap) !== "{}") {
-      this.update(updateData);
-    }
-    this.query_tab();
-  }, this.sendDataTimer);
-};
 
-const button = document.querySelector("button");
-button.addEventListener("click", async () => {
-  clearInterval(timer);
-});
+  onRequestError(details) {
+    if (this.defer(() => this.onRequestError(details))) return;
+    const request = this.requests.get(details.requestId);
+    this.requests.delete(details.requestId);
+    if (request && this.navigations.get(details.tabId) === request.session) {
+      this.navigations.delete(details.tabId);
+    }
+  }
+
+  onCommitted(details) {
+    if (this.defer(() => this.onCommitted(details))) return;
+    if (!this.enabled || (details.documentLifecycle && details.documentLifecycle !== 'active')) return;
+    if (details.frameId !== 0) {
+      const session = this.sessions.get(details.tabId);
+      if (session && details.documentId) {
+        session.documents ||= {};
+        session.documents[details.frameId] = details.documentId;
+      }
+      return;
+    }
+    if (!monitoredURL(details.url)) {
+      this.removeTab(details.tabId);
+      return;
+    }
+    let session = this.sessions.get(details.tabId);
+    if (!session || (session.documentId && session.documentId !== details.documentId)) {
+      session = this.navigations.get(details.tabId);
+      if (!session) {
+        session = newSession(details.url, details.documentId);
+        session.awaitingRequest = true;
+      }
+      this.sessions.set(details.tabId, session);
+    }
+    this.navigations.delete(details.tabId);
+    session.documentId = details.documentId;
+    session.documents = { 0: details.documentId };
+    session.url = details.url;
+  }
+
+  async onPageLoad(message, sender) {
+    if (!this.enabled || sender.id !== this.api.runtime.id ||
+        !sender.tab || sender.frameId !== 0 || !sender.documentId || !monitoredURL(sender.url)) return;
+    const values = [message.pageLoadTotalMs, message.pageLoadNetworkMs, message.pageLoadRenderMs];
+    if (!values.every(value => Number.isFinite(value) && value >= 0)) return;
+    // A late message from the previous document must never contaminate this tab.
+    const frames = await this.api.webNavigation.getAllFrames({ tabId: sender.tab.id });
+    const top = frames?.find(frame => frame.frameId === 0 && frame.documentLifecycle !== 'prerender');
+    if (!top || top.documentId !== sender.documentId || !this.enabled) return;
+    let session = this.sessions.get(sender.tab.id);
+    if (!session) {
+      session = newSession(sender.url, sender.documentId);
+      this.sessions.set(sender.tab.id, session);
+    }
+    if (session.documentId !== sender.documentId) return;
+    session.awaitingRequest = false;
+    [session.pageLoadTotalDurationMs, session.pageLoadNetworkDurationMs, session.pageLoadRenderDurationMs] = values.map(Math.floor);
+    await this.save();
+  }
+
+  removeTab(tabId) {
+    if (this.defer(() => this.removeTab(tabId))) return;
+    this.sessions.delete(tabId);
+    this.navigations.delete(tabId);
+    for (const [id, request] of this.requests) {
+      if (request.tabId === tabId) this.requests.delete(id);
+    }
+  }
+
+  pruneRequests(now) {
+    for (const [tabId, session] of this.navigations) {
+      if (now - session.startedAt > REQUEST_TTL_MS) this.navigations.delete(tabId);
+    }
+    for (const [id, request] of this.requests) {
+      if (now - request.start > REQUEST_TTL_MS) this.requests.delete(id);
+    }
+  }
+
+  save() {
+    return this.api.storage.session.set({ [SESSION_KEY]: Object.fromEntries(this.sessions) });
+  }
+
+  async collect() {
+    if (!this.enabled || this.collecting) return;
+    this.collecting = true;
+    try {
+      this.pruneRequests(Date.now());
+      const tabs = await this.api.tabs.query({});
+      const liveTabs = new Set(tabs.map(tab => tab.id));
+      for (const id of this.sessions.keys()) if (!liveTabs.has(id)) this.removeTab(id);
+      // Limit concurrent frame queries for profiles with hundreds of tabs.
+      const messages = new Map();
+      for (let offset = 0; offset < tabs.length && this.enabled; offset += 8) {
+        await Promise.all(tabs.slice(offset, offset + 8).map(async tab => {
+          if (tab.discarded || !monitoredURL(tab.url)) return;
+          let frames;
+          try {
+            frames = await this.api.webNavigation.getAllFrames({ tabId: tab.id });
+          } catch {
+            return; // Tabs may close or navigate while this query is in flight.
+          }
+          const active = (frames || []).filter(frame => !frame.errorOccurred &&
+            (!frame.documentLifecycle || frame.documentLifecycle === 'active'));
+          const top = active.find(frame => frame.frameId === 0);
+          if (!top || !monitoredURL(top.url)) return;
+          const tabSession = this.sessions.get(tab.id);
+          if (tabSession?.documentId === top.documentId) {
+            tabSession.documents = Object.fromEntries(active.map(frame => [frame.frameId, frame.documentId]));
+          }
+          for (const frame of active) {
+            if (!Number.isInteger(frame.processId) || frame.processId <= 0 || !monitoredURL(frame.url)) continue;
+            const isSubframe = frame.frameId !== 0;
+            if (isSubframe && frame.processId === top.processId) continue;
+            // The native consumer stores one value per renderer. Prefer main
+            // frames globally so a shared iframe cannot overwrite tab metrics.
+            if (messages.has(frame.processId) && (isSubframe || !messages.get(frame.processId).isSubframe)) continue;
+            const session = this.sessions.get(tab.id);
+            const withMetric = !isSubframe && Boolean(session?.documentId) && session.documentId === frame.documentId;
+            messages.set(frame.processId, { browser: this.browser, OS: this.OS,
+              type: 'tab', isSubframe, url: frame.url, rendererClientId: frame.processId,
+              ...(withMetric ? { withMetric: true,
+                ...Object.fromEntries(METRIC_FIELDS.map(key => [key, session[key]])) } : {}) });
+          }
+        }));
+      }
+      if (this.enabled) {
+        await this.save();
+        for (const message of messages.values()) if (!this.native.send(message)) break;
+      }
+    } finally {
+      this.collecting = false;
+    }
+  }
+}

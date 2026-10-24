@@ -64,12 +64,14 @@ bool processUtilsGetProcessArguments(pid_t pid, std::vector<std::string>* argv) 
 }
 
 std::string processUtilsGetWebKitActiveUrl(pid_t pid) {
-    NSString *url = getWebKitActiveURL(pid);
-    if (!url) {
-        url = getWebKitDisplayName(pid);
+    @autoreleasepool {
+        NSString *url = getWebKitActiveURL(pid);
+        if (!url) {
+            url = getWebKitDisplayName(pid);
+        }
+        if (!url) {
+            return {};
+        }
+        return std::string([url UTF8String]);
     }
-    if (!url) {
-        return {};
-    }
-    return std::string([url UTF8String]);
 }

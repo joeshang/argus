@@ -216,6 +216,18 @@ class NativeIntegration(unittest.TestCase):
                 code = helper.wait(timeout=5)
                 self.assertGreater(code, 0)  # Ordinary error, not termination by SIGPIPE.
 
+    def test_helper_stamps_browser_identity_from_its_real_parent(self):
+        with server(self.directory) as service, process(HELPER, self.directory) as helper:
+            receive(helper.stdout)
+            message = {'type': 'snapshot', 'protocolVersion': 2, 'browser': 'chrome',
+                       'browserPid': 999999, 'browserStartTime': '1', 'sourceId': 'test-profile',
+                       'generation': 1, 'partIndex': 0, 'partCount': 1, 'frames': []}
+            helper.stdin.write(framed(json.dumps(message).encode()))
+            forwarded = json.loads(line(service.stdout).removeprefix(b'MESSAGE '))
+            self.assertEqual(forwarded['browserPid'], os.getpid())
+            self.assertGreater(int(forwarded['browserStartTime']), 1)
+            self.assertEqual(forwarded['sourceId'], 'test-profile')
+
     def test_browser_eof_drains_a_large_complete_frame(self):
         with socket.socket(socket.AF_UNIX, socket.SOCK_STREAM) as listener:
             listener.bind(str(self.directory / 'channel.sock'))

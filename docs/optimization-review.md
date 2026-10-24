@@ -52,13 +52,13 @@ Service 持有独占 flock，防止第二个实例删除活跃实例的 socket�
 本机真实校准确认 rusage 的 CPU 值来自 Mach ticks，需按 timebase 换算；保留转换并用 128 位中间值避免乘法溢出。与独立 getrusage 的 100ms CPU 工作负载校准比例为 1.00014，已加入漂移、PID 复用、失败恢复及边界回归。
 
 
-### P2：协议增加浏览器实例和一对多映射
+### 已修复 P2：协议增加浏览器实例和一对多映射
 
-位置：`BrowserMonitor.cpp` 的 receiveMessage / queryBrowserProcesses；`BrowserMonitor.hpp` 的 m_chromeTabInfos / m_edgeTabInfos。
+协议 v2 由 Helper 注入真实浏览器父进程 PID / 启动 ticks，Service 以根实例身份 + renderer ID 关联进程；按 profile 会话 UUID 保留所有 tab / frame / document / URL。多根浏览器通过真实父子进程树识别，不再只保留一个根 PID。
 
-当前每种浏览器只记一个根 PID，每个 rendererClientId 只记一个 WebMetricData。不同 user-data-dir 启动的独立浏览器实例可复用 renderer ID；共享 renderer 的多个 tab 会互相覆盖，历史 URL map 也没有过期策略。
+扩展发完整分块快照，Service 原子替换并清理关闭标签页；断开即清除连接记录，15 秒无完整更新清除过期状态，进程退出 / 根 PID 复用也会清理。UI 保留共享进程的全部 URL，页面指标按 browser PID / source / tab 分行。
 
-建议以浏览器实例 / 根 PID 与 renderer ID 做复合键，保留 tabId、frameId、documentId 和 URL 列表，增加快照代次或关闭事件来清理失效映射；明确 UI 展示的是进程资源而非精确 tab 分摊。此项需扩展、Helper 和原生消费者共同升级，故此次保留原协议。
+新增实际双根进程树测试：两个实例故意使用相同 renderer ID / tab ID，同一实例的两个 profile 也重复 tab ID，验证 URL 不串实例、连接断开、空快照和根进程退出。详见[协议](discussions/schema.md)。
 
 ### P2：让构建依赖可复现
 

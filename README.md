@@ -24,7 +24,7 @@ ArgusMacServices
 - [`docs/discussions/schema.md`](docs/discussions/schema.md)：扩展发往原生端的协议及指标口径。
 - [`docs/optimization-review.md`](docs/optimization-review.md)：此次迁移的验证结果与后续优化建议。
 
-CPU / Memory 的采样单位是进程。同一 renderer 可被多个标签页共享，一个标签页也可包含多个 renderer；目前原生协议每个 renderer 只保存一个代表 URL，不能把共享进程资源精确分摊给每个标签页。
+CPU / Memory 的采样单位是进程。同一 renderer 可被多个标签页共享，一个标签页也可包含多个 renderer；协议 v2 保留每个 renderer 的完整 tab / frame / profile / URL 列表，但仍不能把共享进程资源精确分摊给每个标签页。
 
 ## macOS 快速运行
 

@@ -1,4 +1,5 @@
 import { NativeConnection } from './NativeConnection.js';
+import { snapshotMessages } from './SnapshotProtocol.js';
 
 export const HEARTBEAT = 'argus-heartbeat';
 const SESSION_KEY = 'tabSessions';
@@ -30,6 +31,9 @@ export class MonitoringService {
     this.navigations = new Map();
     this.timer = null;
     this.collecting = false;
+    this.sourceId = null;
+    this.generation = 0;
+    this.collectionError = null;
     this.browser = 'unknown';
     this.OS = 'unknown';
     this.native = new NativeConnection(api, () => this.connectionChanged());
@@ -41,7 +45,7 @@ export class MonitoringService {
   async start() {
     const [settings, checkpoint, platform] = await Promise.all([
       this.api.storage.local.get('monitorEnabled'),
-      this.api.storage.session.get(SESSION_KEY),
+      this.api.storage.session.get(null),
       this.api.runtime.getPlatformInfo(),
     ]);
     const brands = this.userAgent?.userAgentData?.brands || [];
@@ -50,6 +54,8 @@ export class MonitoringService {
       ? 'edge' : brands.some(item => item.brand === 'Google Chrome') || /Chrome\//.test(ua)
         ? 'chrome' : 'unknown';
     this.OS = ({ mac: 'macOS', win: 'Windows', linux: 'Linux', cros: 'Chrome OS' })[platform.os] || platform.os;
+    this.sourceId = checkpoint.sourceId || crypto.randomUUID();
+    await this.api.storage.session.set({ sourceId: this.sourceId });
     this.enabled = settings.monitorEnabled !== false;
     this.sessions = new Map(Object.entries(checkpoint[SESSION_KEY] || {}).map(([id, value]) => [Number(id), value]));
     const events = this.pendingEvents;
@@ -101,7 +107,7 @@ export class MonitoringService {
 
   status() {
     return { enabled: this.enabled, connected: Boolean(this.native.port),
-      error: this.native.error, browser: this.browser, OS: this.OS };
+      error: this.native.error || this.collectionError, browser: this.browser, OS: this.OS };
   }
 
   defer(apply) {
@@ -255,7 +261,7 @@ export class MonitoringService {
       const liveTabs = new Set(tabs.map(tab => tab.id));
       for (const id of this.sessions.keys()) if (!liveTabs.has(id)) this.removeTab(id);
       // Limit concurrent frame queries for profiles with hundreds of tabs.
-      const messages = new Map();
+      const records = [];
       for (let offset = 0; offset < tabs.length && this.enabled; offset += 8) {
         await Promise.all(tabs.slice(offset, offset + 8).map(async tab => {
           if (tab.discarded || !monitoredURL(tab.url)) return;
@@ -276,14 +282,12 @@ export class MonitoringService {
           for (const frame of active) {
             if (!Number.isInteger(frame.processId) || frame.processId <= 0 || !monitoredURL(frame.url)) continue;
             const isSubframe = frame.frameId !== 0;
-            if (isSubframe && frame.processId === top.processId) continue;
-            // The native consumer stores one value per renderer. Prefer main
-            // frames globally so a shared iframe cannot overwrite tab metrics.
-            if (messages.has(frame.processId) && (isSubframe || !messages.get(frame.processId).isSubframe)) continue;
             const session = this.sessions.get(tab.id);
             const withMetric = !isSubframe && Boolean(session?.documentId) && session.documentId === frame.documentId;
-            messages.set(frame.processId, { browser: this.browser, OS: this.OS,
-              type: 'tab', isSubframe, url: frame.url, rendererClientId: frame.processId,
+            if (!frame.documentId) continue;
+            records.push({ tabId: tab.id, frameId: frame.frameId,
+              parentFrameId: frame.parentFrameId ?? (isSubframe ? 0 : -1), documentId: frame.documentId,
+              isSubframe, url: frame.url, rendererClientId: frame.processId,
               ...(withMetric ? { withMetric: true,
                 ...Object.fromEntries(METRIC_FIELDS.map(key => [key, session[key]])) } : {}) });
           }
@@ -291,7 +295,14 @@ export class MonitoringService {
       }
       if (this.enabled) {
         await this.save();
-        for (const message of messages.values()) if (!this.native.send(message)) break;
+        try {
+          const messages = snapshotMessages({ browser: this.browser, OS: this.OS,
+            sourceId: this.sourceId, generation: ++this.generation }, records);
+          this.collectionError = null;
+          for (const message of messages) if (!this.native.send(message)) break;
+        } catch (error) {
+          this.collectionError = error.message;
+        }
       }
     } finally {
       this.collecting = false;

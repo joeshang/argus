@@ -48,13 +48,14 @@ void TerminalDisplayer::loop() {
             for (int i = 0; i < urlMaxLength; i++) {
                 urlTitle += " ";
             }
-            std::vector<std::string> titles = {"Process ID", "Type", "CPU", "Memory Footprint", urlTitle};
+            std::vector<std::string> titles = {"Process ID", "Browser PID", "Type", "CPU", "Memory Footprint", urlTitle};
             std::vector<std::vector<std::string>> data = { titles };
             std::vector<int> alerts {};
             int index = 1;
             for (const auto &info: m_perfTableData[name]) {
                 std::vector<std::string> item {};
                 item.push_back(info.processId);
+                item.push_back(info.browserId);
                 item.push_back(info.type);
                 std::stringstream cpu {};
                 double cpuUsage = info.cpuPercent * 100;
@@ -111,6 +112,7 @@ void TerminalDisplayer::loop() {
                 urlTitle += " ";
             }
             std::vector<std::string> titles = {
+                "Browser PID", "Source", "Tab ID", "Document",
                 "WebRequest",
                 "PageLoadTotal",
                 "PageLoadNetwork",
@@ -126,6 +128,10 @@ void TerminalDisplayer::loop() {
             std::vector<int> alerts {};
             for (const auto &info: m_webMetricTableData[name]) {
                 std::vector<std::string> item {};
+                item.push_back(std::to_string(info.browser.pid));
+                item.push_back(info.sourceId.substr(0, 8));
+                item.push_back(std::to_string(info.tabId));
+                item.push_back(info.documentId.substr(0, 8));
                 item.push_back(std::to_string(info.webRequestDurationMs));
                 item.push_back(std::to_string(info.pageLoadTotalDurationMs));
                 item.push_back(std::to_string(info.pageLoadNetworkDurationMs));

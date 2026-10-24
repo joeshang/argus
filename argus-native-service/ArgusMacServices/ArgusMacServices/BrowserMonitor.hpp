@@ -10,6 +10,7 @@
 
 #include <libproc.h>
 #include "../../../native-common/ProcessUsage.hpp"
+#include "../../../native-common/TabSnapshot.hpp"
 #include <cstdint>
 #include <string>
 #include <functional>
@@ -34,6 +35,7 @@ enum class ChromiumProcessType: int {
     AssetStoreService,
     DataDecoderService,
     V8ProxyResolver,
+    Other,
 };
 
 enum class SafariProcessType: int {
@@ -48,24 +50,13 @@ std::string typeString(SafariProcessType processType);
 
 using UsageData = argus::UsageData;
 
-struct WebMetricData {
-    std::string url;
-    bool isSubframe = false;
-    bool withMetric = false;
-    int webRequestDurationMs = 0;
-    int pageLoadTotalDurationMs = 0;
-    int pageLoadNetworkDurationMs = 0;
-    int pageLoadRenderDurationMs = 0;
-    int requestCount = 0;
-    int httpStatusCount2xx = 0;
-    int httpStatusCount3xx = 0;
-    int httpStatusCount4xx = 0;
-    int httpStatusCount5xx = 0;
-};
+using WebMetricData = argus::FrameData;
 
 struct ChromiumProcessInfo {
-    pid_t pid;
-    ChromiumProcessType type;
+    pid_t pid = 0;
+    ChromiumProcessType type = ChromiumProcessType::Other;
+    argus::BrowserIdentity browser;
+    std::vector<argus::FrameData> frames;
     int rendererClientId = 0;
     std::string url;
     UsageData usage;
@@ -117,7 +108,8 @@ public:
     // Start/stop are called by the owning thread, never from the sample callback.
     void beginMetric(int interval, std::function<void(BrowserSnapshot)> callback);
     void stopMetric();
-    void receiveMessage(const std::string& message);
+    void receiveMessage(uint64_t connectionId, const std::string& message);
+    void disconnect(uint64_t connectionId);
     BrowserSnapshot snapshot() const;
     void printUsage();
 
@@ -136,8 +128,7 @@ private:
     std::vector<ChromiumProcessInfo> m_edgeProcesses;
     std::vector<SafariProcessInfo> m_safariProcesses;
     argus::ProcessUsageTracker m_usage;
-    std::unordered_map<int, WebMetricData> m_chromeTabInfos;
-    std::unordered_map<int, WebMetricData> m_edgeTabInfos;
+    argus::TabSnapshots m_tabs;
 };
 
 #endif /* ProcessMonitor_hpp */

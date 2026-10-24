@@ -10,9 +10,9 @@ int main() {
     // the UI. No producer can post into a destroyed screen or monitor.
     TerminalDisplayer displayer;
     BrowserMonitor monitor;
-    SocketServer server([&monitor](const std::string& message) {
-        monitor.receiveMessage(message);
-    });
+    SocketServer server([&monitor](uint64_t id, const std::string& message) {
+        monitor.receiveMessage(id, message);
+    }, [&monitor](uint64_t id) { monitor.disconnect(id); });
     if (!server.setup()) return EXIT_FAILURE;
     monitor.beginMetric(2, [&displayer](BrowserSnapshot snapshot) {
         displayer.showMetrics(std::move(snapshot));

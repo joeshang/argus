@@ -1,5 +1,6 @@
 #include "../../../native-common/Framing.hpp"
 #include "../../../native-common/LocalSocket.hpp"
+#include "../../../native-common/ProcessUsage.hpp"
 
 #include <csignal>
 #include <chrono>
@@ -9,7 +10,7 @@
 
 namespace {
 
-int bridge(int fd) {
+int bridge(int fd, pid_t browserPid, uint64_t startTime) {
     argus::FrameDecoder browserInput, serviceInput;
     argus::FrameWriter toService, toBrowser;
     bool browserClosed = false;
@@ -34,8 +35,15 @@ int bridge(int fd) {
             if (count > 0) {
                 bool queued = true;
                 const bool valid = decoder.feed(buffer, static_cast<size_t>(count), [&](const std::string& message) {
-                    if (source == 0) queued = queued && toService.append(message);
-                    else queued = queued && toBrowser.append(nlohmann::json(message).dump());
+                    if (source == 0) {
+                        auto value = nlohmann::json::parse(message, nullptr, false);
+                        if (value.is_object() && value.value("type", nlohmann::json()) == "snapshot" &&
+                            value.value("protocolVersion", nlohmann::json()) == 2) {
+                            value["browserPid"] = browserPid;
+                            value["browserStartTime"] = std::to_string(startTime);
+                            queued = queued && toService.append(value.dump());
+                        } else queued = queued && toService.append(message);
+                    } else queued = queued && toBrowser.append(nlohmann::json(message).dump());
                 });
                 if (!valid || !queued) {
                     std::cerr << "Argus Helper: invalid frame or slow consumer\n";
@@ -70,6 +78,9 @@ int main() {
     // stdout pipe. Errors propagate through flush(), producing an ordinary exit.
     std::signal(SIGPIPE, SIG_IGN);
     try {
+        const pid_t browserPid = getppid();
+        const auto browser = argus::readProcessSample(browserPid);
+        if (!browser) throw std::runtime_error("Cannot identify parent browser process");
         auto endpoint = argus::LocalEndpoint::open();
         argus::UniqueFd fd(socket(AF_UNIX, SOCK_STREAM, 0));
         if (fd.get() < 0) throw std::runtime_error("Cannot create socket");
@@ -89,7 +100,7 @@ int main() {
         if (!argus::sameUser(fd.get())) throw std::runtime_error("Native Service belongs to a different user");
         argus::nonblocking(STDIN_FILENO);
         argus::nonblocking(STDOUT_FILENO);
-        return bridge(fd.get());
+        return bridge(fd.get(), browserPid, browser->startTime);
     } catch (const std::exception& error) {
         std::cerr << "Argus Helper: " << error.what() << '\n';
         return EXIT_FAILURE;

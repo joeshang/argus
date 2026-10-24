@@ -17,6 +17,6 @@ Helper 和 Service 必须以同一用户运行，无需 sudo。默认路径为 `
 
 `ARGUS_RUNTIME_DIR` 可将两端指定到同一个绝对路径的私有目录，主要用于测试。使用自定义目录时必须确保 Helper 也能继承相同配置。
 
-消息沿用 4 字节本机字节序长度 + payload 的 framing，单条上限 1 MiB，待发送队列上限 4 MiB，最大客户端数 64。EOF、错误长度及截断帧只影响对应连接，JSON 类型 / 数值非法的数据被 monitor 拒绝。Service 退出会关闭 Helper 的连接，Helper 随即退出，浏览器扩展自动重连。
+协议 v2 使用浏览器根 PID / 启动身份 + renderer ID，保留各 profile 的全部 tab / frame 映射；扩展、Helper、Service 需同时更新。完整分块快照原子替换，断开、关闭标签页、根进程退出和超时均清理旧映射。消息沿用 4 字节本机字节序长度 + payload 的 framing，单条上限 1 MiB，待发送队列上限 4 MiB，最大客户端数 64。EOF、错误长度及截断帧只影响对应连接，JSON 类型 / 数值非法的数据被 monitor 拒绝。Service 退出会关闭 Helper 的连接，Helper 随即退出，浏览器扩展自动重连。
 
 回归、压力测试和 Sanitizer 说明见 [`native-tests`](../native-tests/README.md)。CPU 采样口径、多浏览器实例及依赖构建等剩余工作见[优化报告](../docs/optimization-review.md)。

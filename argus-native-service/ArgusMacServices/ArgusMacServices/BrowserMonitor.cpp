@@ -17,6 +17,9 @@
 
 #include "BrowserMonitor.hpp"
 #include "ProcessUtils.hpp"
+#include "../../../native-common/BrowserProcesses.hpp"
+#include <charconv>
+#include <set>
 
 #include <libproc.h>
 #include <chrono>
@@ -28,59 +31,6 @@
 
 extern "C" {
 extern pid_t responsibility_get_pid_responsible_for_pid(pid_t);
-}
-
-constexpr static const char *s_chromeProcess = "Google Chrome";
-constexpr static const char *s_chromeSubprocessPrefix = "Google Chrome Helper";
-
-constexpr static const char *s_edgeProcess = "Microsoft Edge";
-constexpr static const char *s_edgeSubrocessPrefix = "Microsoft Edge Helper";
-
-constexpr static const char *s_safariProcess = "Safari";
-constexpr static const char *s_webkitWebContentProcess = "com.apple.WebKit.WebContent";
-constexpr static const char *s_webkitGPUProcess = "com.apple.WebKit.GPU";
-constexpr static const char *s_webkitNetworkProcess = "com.apple.WebKit.Networking";
-
-
-WebMetricData decodeMessage(nlohmann::json &json) {
-    WebMetricData data {};
-    if (json.contains("url")) {
-        data.url = json["url"].get<std::string>();
-    }
-    if (json.contains("isSubframe")) {
-        data.isSubframe = json["isSubframe"].get<bool>();
-    }
-    if (json.contains("withMetric")) {
-        data.withMetric = json["withMetric"].get<bool>();
-    }
-    if (json.contains("webRequestDurationMs")) {
-        data.webRequestDurationMs = json["webRequestDurationMs"].get<int>();
-    }
-    if (json.contains("pageLoadTotalDurationMs")) {
-        data.pageLoadTotalDurationMs = json["pageLoadTotalDurationMs"].get<int>();
-    }
-    if (json.contains("pageLoadNetworkDurationMs")) {
-        data.pageLoadNetworkDurationMs = json["pageLoadNetworkDurationMs"].get<int>();
-    }
-    if (json.contains("pageLoadRenderDurationMs")) {
-        data.pageLoadRenderDurationMs = json["pageLoadRenderDurationMs"].get<int>();
-    }
-    if (json.contains("requestCount")) {
-        data.requestCount = json["requestCount"].get<int>();
-    }
-    if (json.contains("httpStatusCount2xx")) {
-        data.httpStatusCount2xx = json["httpStatusCount2xx"].get<int>();
-    }
-    if (json.contains("httpStatusCount3xx")) {
-        data.httpStatusCount3xx = json["httpStatusCount3xx"].get<int>();
-    }
-    if (json.contains("httpStatusCount4xx")) {
-        data.httpStatusCount4xx = json["httpStatusCount4xx"].get<int>();
-    }
-    if (json.contains("httpStatusCount5xx")) {
-        data.httpStatusCount5xx = json["httpStatusCount5xx"].get<int>();
-    }
-    return data;
 }
 
 BrowserMonitor::~BrowserMonitor() {
@@ -121,18 +71,15 @@ void BrowserMonitor::beginMetric(int interval, std::function<void(BrowserSnapsho
 
 BrowserSnapshot BrowserMonitor::snapshotLocked() const {
     BrowserSnapshot result { m_chromeProcesses, m_edgeProcesses, m_safariProcesses, {}, {}, {} };
-    auto metrics = [](const auto& processes, const auto& tabs) {
+    auto metrics = [](const auto& processes) {
         std::vector<WebMetricData> values;
-        for (const auto& process : processes) {
-            const auto found = tabs.find(process.rendererClientId);
-            if (process.type == ChromiumProcessType::Tab && found != tabs.end() && found->second.withMetric) {
-                values.push_back(found->second);
-            }
+        for (const auto& process : processes) for (const auto& frame : process.frames) {
+            if (!frame.isSubframe && frame.withMetric) values.push_back(frame);
         }
         return values;
     };
-    result.chromeWebMetric = metrics(m_chromeProcesses, m_chromeTabInfos);
-    result.edgeWebMetric = metrics(m_edgeProcesses, m_edgeTabInfos);
+    result.chromeWebMetric = metrics(m_chromeProcesses);
+    result.edgeWebMetric = metrics(m_edgeProcesses);
     return result;
 }
 
@@ -141,137 +88,86 @@ BrowserSnapshot BrowserMonitor::snapshot() const {
     return snapshotLocked();
 }
 
-void BrowserMonitor::receiveMessage(const std::string& message) {
-    auto json = nlohmann::json::parse(message, nullptr, false);
-    if (!json.is_object() || !json.contains("type") || json["type"] != "tab" ||
-        !json.contains("browser") || !json["browser"].is_string() ||
-        !json.contains("rendererClientId") || !json["rendererClientId"].is_number_integer() ||
-        json["rendererClientId"] <= 0 || json["rendererClientId"] > std::numeric_limits<int>::max()) return;
-    const auto browser = json["browser"].get<std::string>();
-    if (browser != "chrome" && browser != "edge") return;
-    if (json.contains("url") && !json["url"].is_string()) return;
-    for (const auto* key : { "isSubframe", "withMetric" }) {
-        if (json.contains(key) && !json[key].is_boolean()) return;
-    }
-    for (const auto* key : { "webRequestDurationMs", "pageLoadTotalDurationMs", "pageLoadNetworkDurationMs",
-            "pageLoadRenderDurationMs", "requestCount", "httpStatusCount2xx", "httpStatusCount3xx",
-            "httpStatusCount4xx", "httpStatusCount5xx" }) {
-        if (json.contains(key) && (!json[key].is_number_integer() || json[key] < 0 ||
-            json[key] > std::numeric_limits<int>::max())) return;
-    }
-    const auto rendererClientId = json["rendererClientId"].get<int>();
-    auto info = decodeMessage(json);
+void BrowserMonitor::receiveMessage(uint64_t connectionId, const std::string& message) {
     std::lock_guard lock(m_mutex);
-    auto& tabs = browser == "chrome" ? m_chromeTabInfos : m_edgeTabInfos;
-    tabs[rendererClientId] = std::move(info);
+    m_tabs.receive(connectionId, message);
+}
+
+void BrowserMonitor::disconnect(uint64_t connectionId) {
+    std::lock_guard lock(m_mutex);
+    m_tabs.disconnect(connectionId);
 }
 
 void BrowserMonitor::queryBrowserProcesses() {
-    int pid_size_needed = proc_listallpids(nullptr, 0);
-    if (pid_size_needed <= 0) {
-        return;
-    }
-
-    std::vector<pid_t> pids(pid_size_needed);
-    int pid_count = proc_listallpids(pids.data(), int(pids.size() * sizeof(pid_t)));
-    if (pid_count <= 0) {
-        return;
-    }
-
-    pids.resize(pid_count);
-    sort(pids.begin(), pids.end());
-
-    std::vector<ChromiumProcessInfo> chrome {};
-    std::vector<ChromiumProcessInfo> edge {};
-    std::vector<SafariProcessInfo> safari {};
-
-    pid_t chromeId = 0;
-    pid_t edgeId = 0;
-    pid_t safariId = 0;
-    for (auto &pid: pids) {
-        char buffer[MAXPATHLEN] {};
-        if (proc_name(pid, buffer, sizeof(buffer)) <= 0) continue;
-        std::string name = buffer;
-        if (name == s_chromeProcess) {
-            chromeId = pid;
-            ChromiumProcessInfo info;
-            info.pid = pid;
-            info.type = ChromiumProcessType::Browser;
-            chrome.push_back(info);
-        } else if (name == s_edgeProcess) {
-            edgeId = pid;
-            ChromiumProcessInfo info;
-            info.pid = pid;
-            info.type = ChromiumProcessType::Browser;
-            edge.push_back(info);
-        } else if (name == s_safariProcess) {
-            safariId = pid;
-            SafariProcessInfo info;
+    const auto records = argus::readProcessRecords();
+    std::map<pid_t, argus::BrowserRoot> roots;
+    std::set<argus::BrowserIdentity> live;
+    std::vector<ChromiumProcessInfo> chrome, edge;
+    std::vector<SafariProcessInfo> safari;
+    for (const auto& [pid, record] : records) {
+        const auto kind = argus::browserKind(record.name);
+        if (kind.empty()) continue;
+        const auto sample = argus::readProcessSample(pid);
+        if (!sample) continue;
+        const argus::BrowserIdentity identity { pid, sample->startTime };
+        roots.emplace(pid, argus::BrowserRoot { identity, kind });
+        live.insert(identity);
+        if (kind == "safari") {
+            SafariProcessInfo info {};
             info.pid = pid;
             info.type = SafariProcessType::Browser;
             safari.push_back(info);
+        } else {
+            ChromiumProcessInfo info;
+            info.pid = pid;
+            info.browser = identity;
+            info.type = ChromiumProcessType::Browser;
+            (kind == "chrome" ? chrome : edge).push_back(info);
         }
     }
-
-    for (auto &pid: pids) {
-        char buffer[MAXPATHLEN] {};
-        if (proc_name(pid, buffer, sizeof(buffer)) <= 0) continue;
-        std::string name = buffer;
-
-        // Other apps which use WebKit will have the same name of com.apple.WebKit.WebContent
-        // and we can't use ppid to identify which one is belong to Safari, because all WebContent's ppid is 1 (launchd)
-        // Actually, on macos we need use private api `responsibility_get_pid_responsible_for_pid` to fetch real "ppid" (with root)
-        // https://apple.stackexchange.com/questions/327290/how-process-hierarchy-works-in-macos
-        pid_t ppid = responsibility_get_pid_responsible_for_pid(pid);
-
-        if (name.starts_with(s_chromeSubprocessPrefix) && ppid == chromeId) {
+    m_tabs.expire();
+    m_tabs.retain(live);
+    for (const auto& [pid, record] : records) {
+        if (roots.contains(pid)) continue;
+        const auto root = argus::browserAncestor(record.parent, records, roots);
+        const bool chromiumHelper = record.name.find("Helper") != std::string::npos &&
+            (record.name.starts_with("Google Chrome") || record.name.starts_with("Microsoft Edge") || record.name.starts_with("Chromium"));
+        if (root && root->kind != "safari" && chromiumHelper) {
             ChromiumProcessInfo info;
             info.pid = pid;
+            info.browser = root->identity;
             handleChromiumProcessArguments(info);
-            if (m_chromeTabInfos.contains(info.rendererClientId)) {
-                auto tabInfo = m_chromeTabInfos[info.rendererClientId];
-                info.url = tabInfo.url;
-                if (tabInfo.isSubframe) {
-                    info.type = ChromiumProcessType::Subframe;
-                }
+            info.frames = m_tabs.frames(root->identity, root->kind, info.rendererClientId);
+            std::set<std::string> urls;
+            bool onlySubframes = !info.frames.empty();
+            for (const auto& frame : info.frames) {
+                urls.insert(frame.url);
+                onlySubframes = onlySubframes && frame.isSubframe;
             }
-            chrome.push_back(info);
-        } else if (name.starts_with(s_edgeSubrocessPrefix) && ppid == edgeId) {
-            ChromiumProcessInfo info;
+            for (const auto& url : urls) {
+                if (!info.url.empty()) info.url += " | ";
+                info.url += url;
+            }
+            if (onlySubframes) info.type = ChromiumProcessType::Subframe;
+            (root->kind == "chrome" ? chrome : edge).push_back(std::move(info));
+        } else if (record.name == "com.apple.WebKit.WebContent" || record.name == "com.apple.WebKit.GPU" ||
+                   record.name == "com.apple.WebKit.Networking") {
+            const auto responsible = roots.find(responsibility_get_pid_responsible_for_pid(pid));
+            if (responsible == roots.end() || responsible->second.kind != "safari") continue;
+            SafariProcessInfo info {};
             info.pid = pid;
-            handleChromiumProcessArguments(info);
-            if (m_edgeTabInfos.contains(info.rendererClientId)) {
-                auto tabInfo = m_edgeTabInfos[info.rendererClientId];
-                info.url = tabInfo.url;
-                if (tabInfo.isSubframe) {
-                    info.type = ChromiumProcessType::Subframe;
-                }
-            }
-            edge.push_back(info);
-        } else if (ppid == safariId) {
-            if (name == s_webkitWebContentProcess) {
-                SafariProcessInfo info;
-                info.pid = pid;
+            if (record.name == "com.apple.WebKit.WebContent") {
                 info.type = SafariProcessType::Tab;
                 info.url = processUtilsGetWebKitActiveUrl(pid);
-                safari.push_back(info);
-            } else if (name == s_webkitGPUProcess) {
-                SafariProcessInfo info;
-                info.pid = pid;
-                info.type = SafariProcessType::GPU;
-                safari.push_back(info);
-            } else if (name == s_webkitNetworkProcess) {
-                SafariProcessInfo info;
-                info.pid = pid;
-                info.type = SafariProcessType::Network;
-                safari.push_back(info);
-            }
+            } else info.type = record.name == "com.apple.WebKit.GPU" ? SafariProcessType::GPU : SafariProcessType::Network;
+            safari.push_back(std::move(info));
         }
     }
-
-    m_chromeProcesses = chrome;
-    m_edgeProcesses = edge;
-    m_safariProcesses = safari;
+    auto order = [](auto& processes) { std::sort(processes.begin(), processes.end(), [](const auto& a, const auto& b) { return a.pid < b.pid; }); };
+    order(chrome); order(edge); order(safari);
+    m_chromeProcesses = std::move(chrome);
+    m_edgeProcesses = std::move(edge);
+    m_safariProcesses = std::move(safari);
 }
 
 void BrowserMonitor::fetchBrowserProcessUsage() {
@@ -369,7 +265,9 @@ void BrowserMonitor::handleChromiumProcessArguments(ChromiumProcessInfo &info) {
         } else if (argument.starts_with("--renderer-client-id=")) {
             std::string prefix = "--renderer-client-id=";
             std::string clientId = argument.substr(prefix.size(), argument.size() - prefix.size());
-            info.rendererClientId = std::stoi(clientId);
+            int parsed = 0;
+            const auto result = std::from_chars(clientId.data(), clientId.data() + clientId.size(), parsed);
+            if (result.ec == std::errc() && result.ptr == clientId.data() + clientId.size() && parsed > 0) info.rendererClientId = parsed;
         }
     }
 
@@ -386,6 +284,9 @@ void BrowserMonitor::handleChromiumProcessArguments(ChromiumProcessInfo &info) {
 std::string typeString(ChromiumProcessType processType) {
     std::string type {};
     switch (processType) {
+        case ChromiumProcessType::Other:
+            type = "Other";
+            break;
         case ChromiumProcessType::Browser:
             type = "Browser";
             break;

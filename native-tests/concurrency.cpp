@@ -5,6 +5,7 @@
 #include <chrono>
 #include <iostream>
 #include <thread>
+#include <unistd.h>
 
 int main() {
     BrowserMonitor monitor;
@@ -17,8 +18,12 @@ int main() {
     for (int worker = 0; worker < 4; ++worker) {
         writers.emplace_back([&, worker] {
             for (int i = 0; i < 10000; ++i) {
-                monitor.receiveMessage("{\"browser\":\"chrome\",\"type\":\"tab\",\"rendererClientId\":" +
-                    std::to_string((i + worker * 1000) % 2000 + 1) + ",\"url\":\"https://example.com/\",\"withMetric\":true,\"requestCount\":1}");
+                const auto message = nlohmann::json {
+                    {"type", "snapshot"}, {"protocolVersion", 2}, {"browser", "chrome"},
+                    {"browserPid", getpid()}, {"browserStartTime", "1"}, {"sourceId", "worker-" + std::to_string(worker)},
+                    {"generation", i + 1}, {"partIndex", 0}, {"partCount", 1}, {"frames", nlohmann::json::array()}
+                };
+                monitor.receiveMessage(worker + 1, message.dump());
             }
         });
     }
@@ -31,7 +36,7 @@ int main() {
     for (const auto* message : { "garbage", "[]", "null", "{\"type\":\"tab\",\"browser\":true}",
             "{\"type\":\"tab\",\"browser\":\"chrome\",\"rendererClientId\":1,\"requestCount\":\"bad\"}",
             "{\"type\":\"tab\",\"browser\":\"chrome\",\"rendererClientId\":18446744073709551615}" }) {
-        monitor.receiveMessage(message);
+        monitor.receiveMessage(1, message);
     }
     monitor.stopMetric();
     assert(callbacks > 0);

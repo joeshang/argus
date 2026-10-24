@@ -110,7 +110,7 @@ test('does not send page A metrics with page B process metadata', async t => {
   await service.onPageLoad(loadMessage, sender(api));
   frames[1] = [frame({ documentId: 'doc-2' })];
   await service.collect();
-  assert.equal(sent.at(-1).withMetric, undefined);
+  assert.equal(sent.at(-1).frames[0].withMetric, undefined);
 });
 
 test('unordered frames, duplicate processes, prerenders and unavailable tabs are handled', async t => {
@@ -123,20 +123,22 @@ test('unordered frames, duplicate processes, prerenders and unavailable tabs are
   });
   await service.onPageLoad(loadMessage, sender(api));
   await service.collect();
-  assert.deepEqual(sent.map(message => message.rendererClientId).sort(), [101, 201]);
-  assert.equal(sent.find(message => message.rendererClientId === 101).isSubframe, false);
-  assert.equal(sent.find(message => message.rendererClientId === 101).pageLoadTotalDurationMs, 100);
-  assert.equal(sent.find(message => message.rendererClientId === 201).isSubframe, true);
+  const records = sent.flatMap(message => message.frames);
+  assert.deepEqual(records.map(message => message.rendererClientId).sort(), [101, 101, 201, 201]);
+  assert.equal(records.find(message => message.rendererClientId === 101 && !message.isSubframe).isSubframe, false);
+  assert.equal(records.find(message => message.rendererClientId === 101 && !message.isSubframe).pageLoadTotalDurationMs, 100);
+  assert.equal(records.find(message => message.rendererClientId === 201).isSubframe, true);
 });
 
-test('main frames take precedence over shared iframes across tabs', async t => {
+test('shared renderers preserve main frames and iframes across tabs', async t => {
   const { service, sent } = await setup(t, {
     tabs: [{ id: 1, url: 'https://example.com/' }, { id: 2, url: 'https://child.com/' }],
     frames: { 1: [frame(), frame({ frameId: 2, processId: 201 })],
       2: [frame({ processId: 201, url: 'https://child.com/' })] },
   });
   await service.collect();
-  assert.equal(sent.find(message => message.rendererClientId === 201).isSubframe, false);
+  const records = sent.flatMap(message => message.frames);
+  assert.equal(records.filter(message => message.rendererClientId === 201).length, 2);
 });
 
 test('reconnects after native host disconnect without creating duplicate ports', async t => {

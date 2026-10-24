@@ -20,6 +20,7 @@ using namespace ftxui;
 
 struct PerfTableItem {
     std::string processId;
+    std::string browserId;
     std::string type;
     double cpuPercent;
     bool available;
@@ -29,6 +30,7 @@ struct PerfTableItem {
 
     PerfTableItem(const ChromiumProcessInfo &info) {
         processId = std::to_string(info.pid);
+        browserId = std::to_string(info.browser.pid);
         type = typeString(info.type);
         cpuPercent = info.usage.cpuPercent;
         available = info.usage.available;
@@ -38,6 +40,7 @@ struct PerfTableItem {
     }
 
     PerfTableItem(const SafariProcessInfo &info) {
+        browserId = "—";
         processId = std::to_string(info.pid);
         type = typeString(info.type);
         cpuPercent = info.usage.cpuPercent;

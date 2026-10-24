@@ -13,6 +13,7 @@ namespace {
 constexpr size_t kMaxClients = 64;
 
 struct Client {
+    uint64_t id;
     argus::UniqueFd fd;
     argus::FrameDecoder decoder;
     argus::FrameWriter writer;
@@ -20,8 +21,10 @@ struct Client {
 }
 
 struct SocketServer::State {
-    explicit State(std::function<void(const std::string&)> callback) : handle(std::move(callback)) {}
-    std::function<void(const std::string&)> handle;
+    State(MessageHandler callback, CloseHandler onClose) : handle(std::move(callback)), closed(std::move(onClose)) {}
+    MessageHandler handle;
+    CloseHandler closed;
+    uint64_t nextId = 1;
     std::unique_ptr<argus::LocalEndpoint> endpoint;
     argus::UniqueFd lock;
     argus::UniqueFd listener;
@@ -34,6 +37,7 @@ struct SocketServer::State {
     ~State() {
         running = false;
         if (thread.joinable()) thread.join();
+        for (const auto& client : clients) notifyClosed(client.id);
         clients.clear();
         listener = argus::UniqueFd();
         // Keep the lock file inode stable across runs. Only remove our socket
@@ -43,6 +47,10 @@ struct SocketServer::State {
             info.st_ino == inode && info.st_dev == device) {
             unlinkat(endpoint->directory.get(), "channel.sock", 0);
         }
+    }
+
+    void notifyClosed(uint64_t id) noexcept {
+        try { if (closed) closed(id); } catch (...) {}
     }
 
     void acceptClients() {
@@ -57,7 +65,7 @@ struct SocketServer::State {
             try {
                 argus::nonblocking(fd.get());
                 argus::noSigPipe(fd.get());
-                Client client { std::move(fd), {}, {} };
+                Client client { nextId++, std::move(fd), {}, {} };
                 client.writer.append("native service connected");
                 clients.push_back(std::move(client));
             } catch (const std::exception& error) {
@@ -74,7 +82,7 @@ struct SocketServer::State {
             const auto count = read(client.fd.get(), buffer, sizeof(buffer));
             if (count > 0) {
                 try {
-                    if (!client.decoder.feed(buffer, static_cast<size_t>(count), handle)) return false;
+                    if (!client.decoder.feed(buffer, static_cast<size_t>(count), [&](const std::string& message) { handle(client.id, message); })) return false;
                 } catch (const std::exception& error) {
                     std::cerr << "Argus rejected client message: " << error.what() << '\n';
                     return false;
@@ -108,15 +116,15 @@ struct SocketServer::State {
                 if (events & (POLLIN | POLLHUP)) alive = readClient(client);
                 if (alive && (events & POLLOUT)) alive = client.writer.flush(client.fd.get());
                 if (events & (POLLERR | POLLNVAL)) alive = false;
-                if (!alive) clients.erase(clients.begin() + (i - 1));
+                if (!alive) { notifyClosed(client.id); clients.erase(clients.begin() + (i - 1)); }
             }
             if (descriptors[0].revents & POLLIN) acceptClients();
         }
     }
 };
 
-SocketServer::SocketServer(std::function<void(const std::string&)> handle)
-    : m_state(std::make_unique<State>(std::move(handle))) {}
+SocketServer::SocketServer(MessageHandler handle, CloseHandler closed)
+    : m_state(std::make_unique<State>(std::move(handle), std::move(closed))) {}
 SocketServer::~SocketServer() = default;
 
 bool SocketServer::setup() {

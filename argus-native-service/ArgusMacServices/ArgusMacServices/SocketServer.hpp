@@ -1,6 +1,7 @@
 #pragma once
 
 #include <functional>
+#include <cstdint>
 #include <memory>
 #include <string>
 
@@ -8,7 +9,9 @@
 // the callback, so no event can reach a destroyed monitor.
 class SocketServer {
 public:
-    explicit SocketServer(std::function<void(const std::string&)> handle);
+    using MessageHandler = std::function<void(uint64_t, const std::string&)>;
+    using CloseHandler = std::function<void(uint64_t)>;
+    explicit SocketServer(MessageHandler handle, CloseHandler closed = {});
     ~SocketServer();
     SocketServer(const SocketServer&) = delete;
     SocketServer& operator=(const SocketServer&) = delete;

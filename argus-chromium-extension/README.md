@@ -5,7 +5,7 @@
 ## 后台运行方式
 
 - `background.js` 是 ES module Service Worker，事件监听器在模块加载时同步注册。
-- 原生 Host 连接成功时，每 2 秒查询标签页的 frame / renderer 映射并发送兼容原生端的 JSON。`connectNative()` 的连接会保持 worker 活动，见[Chrome 生命周期说明](https://developer.chrome.com/docs/extensions/develop/concepts/service-workers/lifecycle)。
+- 原生 Host 连接成功时，每 2 秒查询标签页的 frame / renderer 映射并发送协议 v2 的分块完整快照。`connectNative()` 的连接会保持 worker 活动，见[Chrome 生命周期说明](https://developer.chrome.com/docs/extensions/develop/concepts/service-workers/lifecycle)。
 - 原生端断开后停止 2 秒轮询，以 1、2、4 秒到最多 30 秒的退避重连；30 秒 alarm 提供 worker 休眠后的恢复入口。暂停时关闭连接与采集，保留暂停设置。
 - `storage.local` 保存启停设置，`storage.session` 保存当前浏览器会话的已汇总指标。每轮采集与页面计时上报时保存检查点；worker 重启恢复最近检查点。尚未完成的请求不持久化，突发终止可能丢失检查点之后的计数；不提供跨浏览器重启的历史存储。
 - 弹窗仅显示状态和控制启停；打开多个弹窗不会创建额外采集器，也不会在安装时自动打开采集页面。
@@ -30,7 +30,7 @@
 
 扩展只通过 Native Messaging 向本地进程发送 URL、进程标识和聚合指标，不包含远程上传逻辑。`chrome://`、扩展页、file URL、已丢弃标签页及未激活的 prerender frame 不采集；Chrome Web Store 等受限页面可能无法注入脚本，因而没有页面计时。安装、更新或重新加载扩展后，需要刷新已有网页才能注入新的 content script；暂停时清空指标，恢复后已有页面需刷新才能重新获得加载计时。
 
-同一 renderer 的消息去重，主 frame 优先于 iframe。多个顶层标签页共享 renderer 时只发一个代表 URL；这是原生消费者以 rendererClientId 为单值键的限制，详见[协议](../docs/discussions/schema.md)。
+每个快照保留所有 tab / frame / document 与 renderer 的对应关系；共享 renderer 的多个标签页、iframe 和不同 profile 不再互相覆盖。Native Helper 注入浏览器根 PID / 启动身份，Service 原子替换快照并清理断开的连接、关闭的标签页及过期 URL。协议 v2 需要扩展、Helper、Service 同时更新，详见[协议](../docs/discussions/schema.md)。
 
 ## 安装与连接排查
 

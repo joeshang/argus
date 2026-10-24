@@ -194,5 +194,13 @@ void TerminalDisplayer::loop() {
             tab_content->Render() | flex,
         });
     });
-    m_screen.Loop(main_renderer);
+    // FTXUI 7 otherwise re-raises SIGINT. Handle the key in the UI loop so
+    // native worker joins and socket cleanup run through ordinary destruction.
+    m_screen.ForceHandleCtrlC(false);
+    auto application = CatchEvent(main_renderer, [this](Event event) {
+        if (event != Event::CtrlC) return false;
+        m_screen.ExitLoopClosure()();
+        return true;
+    });
+    m_screen.Loop(application);
 }

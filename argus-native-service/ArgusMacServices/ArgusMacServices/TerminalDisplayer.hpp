@@ -11,7 +11,7 @@
 #include <unordered_map>
 #include <ftxui/dom/elements.hpp>
 #include <ftxui/dom/table.hpp>
-#include <ftxui/component/screen_interactive.hpp>
+#include <ftxui/component/app.hpp>
 #include <ftxui/screen/screen.hpp>
 
 #include "BrowserMonitor.hpp"
@@ -53,13 +53,13 @@ struct PerfTableItem {
 
 class TerminalDisplayer {
 public:
-    TerminalDisplayer():m_screen(ScreenInteractive::Fullscreen()) {}
+    TerminalDisplayer():m_screen(App::Fullscreen()) {}
 
     void loop();
     void showMetrics(BrowserSnapshot snapshot);
 
 private:
-    ScreenInteractive m_screen;
+    App m_screen;
     std::unordered_map<std::string, std::vector<PerfTableItem>> m_perfTableData;
     std::unordered_map<std::string, std::vector<WebMetricData>> m_webMetricTableData;
 };

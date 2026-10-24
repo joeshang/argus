@@ -1,6 +1,6 @@
 # Native Service
 
-macOS 进程监控与终端界面：识别 Chrome / Edge / Safari 子进程，关联 URL、renderer ID、CPU / Memory 和页面指标。完整构建、Host 注册及运行步骤见[项目 README](../README.md)。
+macOS 进程监控与终端界面：识别 Chrome / Edge / Safari 子进程，关联 URL、renderer ID、CPU / Memory 和页面指标。原生构建统一使用 CMake，FTXUI 7.0.3 与 JSON 3.12.0 固定源码版本及校验值。旧手写 Xcode 工程已移除，可使用 `cmake -G Xcode` 生成。完整构建、Host 注册及运行步骤见[项目 README](../README.md)。
 
 ## 进程和线程
 

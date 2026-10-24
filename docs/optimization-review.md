@@ -1,6 +1,6 @@
 # Argus 迁移与优化检查
 
-检查日期：2026-10-25。已完成 Chromium 扩展的 Manifest V3 重写，以及本报告四类原生端 P1 修复。P2 / P3 仍为后续工作。
+检查日期：2026-10-25。已完成 Chromium 扩展的 Manifest V3 重写，以及本报告四类原生端 P1 修复。三项 P2 也已完成；P3 仍为后续工作。
 
 ## 已完成
 
@@ -60,9 +60,11 @@ Service 持有独占 flock，防止第二个实例删除活跃实例的 socket�
 
 新增实际双根进程树测试：两个实例故意使用相同 renderer ID / tab ID，同一实例的两个 profile 也重复 tab ID，验证 URL 不串实例、连接断开、空快照和根进程退出。详见[协议](discussions/schema.md)。
 
-### P2：让构建依赖可复现
+### 已修复 P2：让构建依赖可复现
 
-仓库提交了预编译 FTXUI 静态库，当前 Service target 最低版本为 macOS 12.3，而这些库至少部分对象以 12.6 构建，链接产生版本警告。建议通过固定版本的构建配置重新构建依赖，统一最低系统版本，记录架构与许可证；加上 CI 的 Node 测试及 macOS 原生编译检查。
+新增根 CMake 工程与 presets，使用 FetchContent 固定 FTXUI 7.0.3 / JSON 3.12.0 的 commit 和 SHA-256，去除仓库中的预编译静态库、重复头文件和手工维护的 Xcode 工程。依赖与应用共用编译器、架构及 macOS 12.3 部署目标，不再混用以 12.6 构建的二进制。
+
+CMake 支持 CLI、Xcode 生成、安装与许可证打包，CTest 集成 8 组原生测试。Sanitizer 同时插桩 Argus 与 FTXUI 源码；新增 GitHub CI 的 Node 测试和 macOS Debug / UBSan 构建测试。FTXUI 7 的默认 Ctrl+C 信号行为已适配为应用正常退出，以保留线程 join 和 socket 清理。依赖与离线配置见[依赖清单](../THIRD_PARTY.md)。
 
 ### P3：进一步降低监控本身的开销
 
@@ -70,11 +72,11 @@ Service 持有独占 flock，防止第二个实例删除活跃实例的 socket�
 
 ## 验证与边界
 
-- `npm test`：manifest / 身份、请求聚合、导航竞态、消息校验、计时、重连、清理与持久化测试通过。
+- `npm test`：30 项测试通过，含分块快照、共享 renderer、身份持久化和协议边界。
 - Chrome for Testing 145.0.7632.6（macOS arm64，独立临时 profile）：MV3 worker 真实加载，弹窗关闭后正常采集，页面计时上报、真实 frame processId 与 renderer-client-id 对应、暂停 / 恢复及 worker 终止恢复通过。
-- Xcode 26.0.1：Helper 与 Native Service 的 Debug 编译通过；Service 保留上述已有的 FTXUI 部署版本警告。
+- CMake Debug 与 UBSan 的 8 个 CTest 组均通过；生成的 Xcode Debug 工程构建通过，已消除旧 FTXUI 预编译部署版本不一致的问题。Xcode 链接器仍可报告系统 objc 重复链接提示。
 - `native-tests/run.sh`：实际 SocketServer / Helper / BrowserMonitor 的拆包、边界、生命周期、权限、40,000 条并发消息与快照读取，以及真实终端界面通信 / 切换 / 退出均有回归测试。测试使用私有临时目录和模拟浏览器 stdio，不改写用户 Native Host 注册。
-- `native-tests/run.sh` 与 `SANITIZER=undefined native-tests/run.sh` 本次均通过，包含 11 项真实进程集成测试、并发与真实 UI 检查；ASan / TSan 在当前 Xcode 26.0.1 与本机 dyld 初始化阶段分别卡住 / 崩溃，最小 hello-world 同样复现，不能计为通过。具体复现见[原生测试说明](../native-tests/README.md)。
+- `native-tests/run.sh` 与 `SANITIZER=undefined native-tests/run.sh` 本次均通过，包含 12 项真实进程集成测试、并发、实例映射与真实 UI 检查；ASan / TSan 在当前 Xcode 26.0.1 与本机 dyld 初始化阶段分别卡住 / 崩溃，最小 hello-world 同样复现，不能计为通过。具体复现见[原生测试说明](../native-tests/README.md)。
 - 未在 Edge / Safari 实机验证，也未把测试 Host 注册到真实 Chrome 验证整条浏览器原生链路。扩展安装 / 重载后需刷新网页。
 
 Chrome 规范参考：[MV2 时间表](https://developer.chrome.com/docs/extensions/develop/migrate/mv2-deprecation-timeline)、[Service Worker 迁移](https://developer.chrome.com/docs/extensions/develop/migrate/to-service-workers)、[生命周期与 Native Port](https://developer.chrome.com/docs/extensions/develop/concepts/service-workers/lifecycle)、[真实浏览器测试](https://developer.chrome.com/docs/extensions/how-to/test/end-to-end-testing)。当前 `getAllFrames` 仍返回 renderer processId，见 [Chromium 实现](https://github.com/chromium/chromium/blob/main/chrome/browser/extensions/api/web_navigation/web_navigation_api.cc)。

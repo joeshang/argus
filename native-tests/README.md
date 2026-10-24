@@ -1,13 +1,26 @@
 # Native regression tests
 
-macOS + Xcode Command Line Tools + Python 3。测试在 `/tmp` 创建独立的 0700 目录和临时二进制，结束后清理；不修改用户 Chrome / Edge 的 Host 注册，不触碰默认运行目录。
+需要 macOS、Xcode Command Line Tools、CMake 3.24+ 和 Python 3.9+。测试在 `/tmp` 创建独立的 0700 运行目录并清理，不修改用户 Host 注册或默认运行目录。CMake 构建缓存位于 `.build/`，重跑复用依赖和产物。
 
 ```sh
 native-tests/run.sh
 SANITIZER=undefined native-tests/run.sh
 ```
 
-编译并运行实际的 Framing、Helper、SocketServer、BrowserMonitor 和终端界面代码，使用仓库中的 FTXUI 静态库与 macOS 进程 API，不替换消息消费者或进程采样实现。
+脚本调用 CMake / CTest，等价于：
+
+```sh
+cmake --preset debug
+cmake --build --preset debug --parallel 4
+ctest --preset debug
+cmake --preset ubsan
+cmake --build --preset ubsan --parallel 4
+ctest --preset ubsan
+```
+
+通过 `ARGUS_BUILD_DIR` / `ARGUS_BUILD_JOBS` 指定脚本的构建目录和并发数。Xcode 多配置构建应使用 `ctest --test-dir <目录> -C Debug`。
+
+8 个 CTest 测试组覆盖实际 Framing、Helper、SocketServer、BrowserMonitor 和终端界面代码，FTXUI 也从固定源码构建；不替换消息消费者或进程采样实现。NativeIntegration 组包含 12 个真实子进程用例。
 
 - `transport.cpp`：每个字节位置的拆包、连续多帧、最大长度、非法长度、EOF、真实 socket 背压 / 短写和 EPIPE。
 - `cpu-usage.cpp`：真实 getrusage 校准、单调时钟间隔、PID 复用、计数倒退、失败恢复和整数换算边界。
@@ -37,4 +50,4 @@ xcrun clang++ -fsanitize=thread /tmp/argus-sanitizer-probe.cpp -o /tmp/argus-san
 /tmp/argus-sanitizer-probe
 ```
 
-将 thread 替换为 address 可复现 ASan 初始化问题。因此本机这两项不计为通过；应在兼容的 macOS / Xcode 组合上执行。UBSan 可单独运行。FTXUI 是已有预编译库，Sanitizer 无法覆盖其未插桩的内部实现；本项目 C++ 代码会按所选选项编译。
+将 thread 替换为 address 可复现 ASan 初始化问题。因此本机这两项不计为通过；应在兼容的 macOS / Xcode 组合上执行。UBSan 可单独运行。CMake 的 Sanitizer 标志同时应用于 Argus 与源码构建的 FTXUI；本次 Debug / UBSan 的 8 个 CTest 组均通过。

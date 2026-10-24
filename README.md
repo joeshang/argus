@@ -28,34 +28,43 @@ CPU / Memory 的采样单位是进程。同一 renderer 可被多个标签页共
 
 ## macOS 快速运行
 
-需要 Xcode；安装脚本和测试需要 Node.js 22+，无需安装 npm 依赖。
+需要 macOS 12.3+、Xcode Command Line Tools 和 CMake 3.24+；测试需要 Python 3.9+，扩展安装脚本 / 测试需要 Node.js 22+。原生依赖通过 CMake FetchContent 固定版本、commit 和 SHA-256 校验从源码引入，首次配置需要联网，详见[依赖清单](THIRD_PARTY.md)。
 
-在项目根目录编译两个原生程序：
+在项目根目录构建并测试：
 
 ```sh
-xcodebuild -project argus-extension-helper/ArgusMacExtensionHelper/ArgusMacExtensionHelper.xcodeproj \
-  -scheme ArgusMacExtensionHelper -configuration Debug \
-  -derivedDataPath /tmp/argus-helper build CODE_SIGNING_ALLOWED=NO
-
-xcodebuild -project argus-native-service/ArgusMacServices/ArgusMacServices.xcodeproj \
-  -scheme ArgusMacServices -configuration Debug \
-  -derivedDataPath /tmp/argus-service build CODE_SIGNING_ALLOWED=NO
+cmake --preset debug
+cmake --build --preset debug --parallel 4
+ctest --preset debug
 ```
 
 为当前用户注册 Native Messaging Host（Edge 将最后一个参数改为 `edge`）：
 
 ```sh
 node argus-chromium-extension/scripts/install-host.mjs \
-  /tmp/argus-helper/Build/Products/Debug/ArgusMacExtensionHelper chrome
+  "$PWD/.build/debug/bin/ArgusMacExtensionHelper" chrome
+.build/debug/bin/ArgusMacServices
 ```
 
-注册文件必须指向 **ArgusMacExtensionHelper**，不是 ArgusMacServices。安装脚本会将正确的绝对路径写入浏览器的 NativeMessagingHosts 目录；正式使用时应把 Helper 放到不会被构建清理删除的位置后再注册。
-
-启动服务：
+注册文件必须指向 **ArgusMacExtensionHelper**，不是 ArgusMacServices。正式使用可安装到稳定位置后重新注册：
 
 ```sh
-/tmp/argus-service/Build/Products/Debug/ArgusMacServices
+cmake --install .build/debug --prefix "$HOME/.local"
+node argus-chromium-extension/scripts/install-host.mjs \
+  "$HOME/.local/bin/ArgusMacExtensionHelper" chrome
+"$HOME/.local/bin/ArgusMacServices"
 ```
+
+使用 Xcode 时，由 CMake 生成工程；旧的手写 `.xcodeproj` 已移除：
+
+```sh
+cmake -S . -B .build/xcode -G Xcode -DBUILD_TESTING=ON \
+  -DCMAKE_XCODE_ATTRIBUTE_CODE_SIGNING_ALLOWED=NO
+cmake --build .build/xcode --config Debug --parallel 4
+ctest --test-dir .build/xcode -C Debug --output-on-failure
+```
+
+可在 Xcode 中打开 `.build/xcode/Argus.xcodeproj`。生成工程与 CLI 构建共用同一份依赖、部署版本和测试定义。
 
 在 Chrome 的 `chrome://extensions`（Edge 的 `edge://extensions`）启用开发者模式，选择「加载已解压的扩展程序」，加载 `argus-chromium-extension/extension` 目录。安装后刷新要采集的网页。扩展自动在后台运行，点击工具栏图标可查看连接状态、暂停或恢复采集。
 

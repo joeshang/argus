@@ -10,6 +10,7 @@ SANITIZER=undefined native-tests/run.sh
 编译并运行实际的 Framing、Helper、SocketServer、BrowserMonitor 和终端界面代码，使用仓库中的 FTXUI 静态库与 macOS 进程 API，不替换消息消费者或进程采样实现。
 
 - `transport.cpp`：每个字节位置的拆包、连续多帧、最大长度、非法长度、EOF、真实 socket 背压 / 短写和 EPIPE。
+- `cpu-usage.cpp`：真实 getrusage 校准、单调时钟间隔、PID 复用、计数倒退、失败恢复和整数换算边界。
 - `helper-offline.py`：服务离线且浏览器 stdin 仍保持打开时，Helper 必须退出；旧实现会超时，此项在修复前已复现失败。
 - `integration.py`：实际进程间的拆包 / 粘包、非法客户端隔离、JSON schema 容错、权限 / 符号链接、重复服务、stale socket、连接清理、路径替换保护、服务重启、浏览器退出、完整大消息 EOF 排空和慢消费者的有界退出。
 - `concurrency.cpp`：4 个线程写入 40,000 条消息，同时读取快照与实际采样；回调重入 snapshot、畸形 schema 及反复启动 / 析构采样线程。

@@ -43,11 +43,14 @@ Service 持有独占 flock，防止第二个实例删除活跃实例的 socket�
 
 ## 后续建议
 
-### P2：规范采样失败与 CPU 差分
+### 已修复 P2：规范采样失败与 CPU 差分
 
 位置：`BrowserMonitor.cpp` 的 queryBrowserProcesses、getProcessUsage。
 
-`proc_name` / `proc_pid_rusage` 失败返回值及缓冲区初始化已随本次线程修复补齐。CPU 分母仍固定为配置间隔，无法反映 timer 实际抖动；PID 复用后无符号差分仍可能下溢。后续应以进程启动标识区分 PID 复用，用单调时钟的真实采样间隔计算 CPU，并核对 rusage 的时间单位，避免错误换算 mach timebase。以空闲、单核忙循环和进程快速退出场景校准。
+新增共用 `ProcessUsageTracker`，按每个 PID 的真实 steady_clock 采样间隔计算 CPU，进程启动 ticks 改变、计数倒退、读取失败和零时间间隔均重建基线；清理不再监测的 PID。首次采样 / 读取失败在 UI 显示不可用，不伪装为 0% 或 0 MB，多核读数可超过 100%。
+
+本机真实校准确认 rusage 的 CPU 值来自 Mach ticks，需按 timebase 换算；保留转换并用 128 位中间值避免乘法溢出。与独立 getrusage 的 100ms CPU 工作负载校准比例为 1.00014，已加入漂移、PID 复用、失败恢复及边界回归。
+
 
 ### P2：协议增加浏览器实例和一对多映射
 

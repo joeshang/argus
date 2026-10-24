@@ -25,7 +25,9 @@ xcrun clang++ "${flags[@]}" "$service/main.cpp" "$service/TerminalDisplayer.cpp"
   "$native_build/socket.o" "$native_build/monitor.o" "$native_build/process.o" "$native_build/webkit.o" \
   -L"$service/library/lib" -lftxui-component -lftxui-dom -lftxui-screen \
   -framework Foundation -framework CoreServices -o "$native_build/ui"
+xcrun clang++ "${flags[@]}" native-tests/cpu-usage.cpp -o "$native_build/cpu-usage"
 "$native_build/transport"
+"$native_build/cpu-usage"
 python3 native-tests/helper-offline.py "$native_build/helper"
 python3 native-tests/integration.py "$native_build/server" "$native_build/helper"
 "$native_build/concurrency"

@@ -21,14 +21,18 @@ using namespace ftxui;
 struct PerfTableItem {
     std::string processId;
     std::string type;
-    float cpuPercent;
-    float memory;
+    double cpuPercent;
+    bool available;
+    bool cpuAvailable;
+    uint64_t memory;
     std::string url;
 
     PerfTableItem(const ChromiumProcessInfo &info) {
         processId = std::to_string(info.pid);
         type = typeString(info.type);
         cpuPercent = info.usage.cpuPercent;
+        available = info.usage.available;
+        cpuAvailable = info.usage.cpuAvailable;
         memory = info.usage.memoryUsage;
         url = info.url;
     }
@@ -37,6 +41,8 @@ struct PerfTableItem {
         processId = std::to_string(info.pid);
         type = typeString(info.type);
         cpuPercent = info.usage.cpuPercent;
+        available = info.usage.available;
+        cpuAvailable = info.usage.cpuAvailable;
         memory = info.usage.memoryUsage;
         url = info.url;
     }

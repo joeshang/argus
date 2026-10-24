@@ -19,7 +19,6 @@
 #include "ProcessUtils.hpp"
 
 #include <libproc.h>
-#include <mach/mach_time.h>
 #include <chrono>
 #include <limits>
 #include <vector>
@@ -102,7 +101,7 @@ void BrowserMonitor::beginMetric(int interval, std::function<void(BrowserSnapsho
     stopMetric();
     {
         std::lock_guard lock(m_mutex);
-        m_sampleInterval = interval;
+        m_usage.clear();
         m_stopping = false;
     }
     m_sampler = std::thread([this, interval, callback = std::move(callback)] {
@@ -276,24 +275,24 @@ void BrowserMonitor::queryBrowserProcesses() {
 }
 
 void BrowserMonitor::fetchBrowserProcessUsage() {
-    std::unordered_map<pid_t, UsageData> currentUsage {};
+    std::unordered_set<pid_t> live;
 
     for (auto &info: m_chromeProcesses) {
         info.usage = getProcessUsage(info.pid);
-        currentUsage[info.pid] = info.usage;
+        live.insert(info.pid);
     }
 
     for (auto &info: m_edgeProcesses) {
         info.usage = getProcessUsage(info.pid);
-        currentUsage[info.pid] = info.usage;
+        live.insert(info.pid);
     }
 
     for (auto &info: m_safariProcesses) {
         info.usage = getProcessUsage(info.pid);
-        currentUsage[info.pid] = info.usage;
+        live.insert(info.pid);
     }
 
-    m_prevUsage = currentUsage;
+    m_usage.retain(live);
 }
 
 void BrowserMonitor::printUsage() {
@@ -336,23 +335,7 @@ void BrowserMonitor::printUsage() {
 }
 
 UsageData BrowserMonitor::getProcessUsage(pid_t pid) {
-    UsageData data {};
-    struct rusage_info_v2 rusage_info_data {};
-    if (proc_pid_rusage(pid, RUSAGE_INFO_V2, (rusage_info_t *)&rusage_info_data) != 0) return data;
-    data.memoryUsage = rusage_info_data.ri_phys_footprint;
-    static const auto timebase = [] {
-        mach_timebase_info_data_t value {};
-        mach_timebase_info(&value);
-        return value;
-    }();
-    data.cpuTime = (rusage_info_data.ri_user_time + rusage_info_data.ri_system_time) * timebase.numer / timebase.denom;
-    uint64_t prevCpuTime = 0;
-    if (m_prevUsage.contains(pid)) {
-        auto prev = m_prevUsage[pid];
-        prevCpuTime = prev.cpuTime;
-        data.cpuPercent = float(data.cpuTime - prevCpuTime) / (float(m_sampleInterval) * 1000000000);
-    }
-    return data;
+    return m_usage.sample(pid);
 }
 
 void BrowserMonitor::handleChromiumProcessArguments(ChromiumProcessInfo &info) {

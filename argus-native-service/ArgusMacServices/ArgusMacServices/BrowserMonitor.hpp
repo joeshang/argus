@@ -9,6 +9,7 @@
 #define ProcessMonitor_hpp
 
 #include <libproc.h>
+#include "../../../native-common/ProcessUsage.hpp"
 #include <cstdint>
 #include <string>
 #include <functional>
@@ -45,11 +46,7 @@ enum class SafariProcessType: int {
 std::string typeString(ChromiumProcessType processType);
 std::string typeString(SafariProcessType processType);
 
-struct UsageData {
-    uint64_t cpuTime = 0;
-    uint64_t memoryUsage = 0;
-    float cpuPercent = 0;
-};
+using UsageData = argus::UsageData;
 
 struct WebMetricData {
     std::string url;
@@ -135,11 +132,10 @@ private:
     std::condition_variable m_wakeup;
     std::thread m_sampler;
     bool m_stopping = true;
-    int m_sampleInterval = 5;
     std::vector<ChromiumProcessInfo> m_chromeProcesses;
     std::vector<ChromiumProcessInfo> m_edgeProcesses;
     std::vector<SafariProcessInfo> m_safariProcesses;
-    std::unordered_map<pid_t, UsageData> m_prevUsage;
+    argus::ProcessUsageTracker m_usage;
     std::unordered_map<int, WebMetricData> m_chromeTabInfos;
     std::unordered_map<int, WebMetricData> m_edgeTabInfos;
 };

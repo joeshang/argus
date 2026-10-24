@@ -57,13 +57,13 @@ void TerminalDisplayer::loop() {
                 item.push_back(info.processId);
                 item.push_back(info.type);
                 std::stringstream cpu {};
-                float cpuUsage = info.cpuPercent * 100;
+                double cpuUsage = info.cpuPercent * 100;
                 cpu << std::fixed << std::setprecision(1) << cpuUsage;
-                item.push_back(cpu.str());
+                item.push_back(info.cpuAvailable ? cpu.str() : "—");
                 std::stringstream mem {};
-                float memUsage = float(info.memory) / 1024 / 1024;
+                double memUsage = double(info.memory) / 1024 / 1024;
                 mem << std::fixed << std::setprecision(1) << memUsage << " MB";
-                item.push_back(mem.str());
+                item.push_back(info.available ? mem.str() : "—");
                 auto url = info.url;
                 if (url.length() > urlMaxLength) {
                     url = url.substr(0, urlMaxLength - 3) + "...";
@@ -72,9 +72,9 @@ void TerminalDisplayer::loop() {
                 data.push_back(item);
 
                 if (info.type == "Tab") {
-                    if (cpuUsage > 30) {
+                    if (info.cpuAvailable && cpuUsage > 30) {
                         alerts.push_back(index);
-                    } else if (memUsage > 200) {
+                    } else if (info.available && memUsage > 200) {
                         alerts.push_back(index);
                     }
                 }
